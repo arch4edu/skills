@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+"""
+AUR CLI tool - read-only edition.
+Provides package comment retrieval, flag comment inspection, and co-maintainer search.
+No login or write operations.
+"""
+
+import hashlib
+import http.cookiejar
+import itertools
+import json
+import re
+import sys
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+
+# Configuration
+CONFIG_DIR = Path.home() / ".config" / "aurcli"
+COOKIE_FILE = CONFIG_DIR / "cookies.json"
+
+
+def ensure_dir(path):
+    """Ensure directory exists."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
+def save_cookies_to_file(cj, filepath):
+    """Save cookies to a JSON file."""
+    ensure_dir(filepath)
+    cookie_dict = {}
+    for cookie in cj:
+        cookie_dict[cookie.name] = cookie.value
+    with open(filepath, 'w') as f:
+        json.dump(cookie_dict, f, indent=2)
+
+
+def load_cookies_from_file(filepath):
+    """Load cookies from a JSON file. Returns CookieJar or None."""
+    if not Path(filepath).exists():
+        return None
+    try:
+        with open(filepath, 'r') as f:
+            cookie_dict = json.load(f)
+        cj = http.cookiejar.CookieJar()
+        for name, value in cookie_dict.items():
+            cookie = http.cookiejar.Cookie(
+                version=0, name=name, value=value, port=None,
+                port_specified=False, domain='.archlinux.org', domain_specified=True,
+                domain_initial_dot=True, path='/', path_specified=True,
+                secure=False, expires=0, discard=False, comment=None, comment_url=None,
+                rest={'HttpOnly': None}, rfc2109=False,
+            )
+            cj.set_cookie(cookie)
+        return cj
+    except Exception as e:
+        print(f"Warning: Failed to load cookies from {filepath}: {e}", file=sys.stderr)
+        return None
+
+
+def create_session():
+    """Create a requests.Session with headers and loaded cookies."""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'arch4edu-aur-cli/1.0 (read-only)',
+    })
+    cj = load_cookies_from_file(COOKIE_FILE)
+    if cj:
+        session.cookies.update(cj)
+    return session
+
+
+def solve_anubis_challenge(challenge, difficulty=4):
+    """Solve Anubis proof-of-work challenge.
+
+    SHA256(challenge + nonce) must start with '0' * difficulty.
+    """
+    target = '0' * difficulty
+    charset = '0123456789abcdef'
+
+    print(f"[*] Solving Anubis challenge (difficulty: {difficulty})...", file=sys.stderr)
+
+    for length in range(1, 10):
+        for nonce_tuple in itertools.product(charset, repeat=length):
+            nonce = ''.join(nonce_tuple)
+            result = hashlib.sha256(f"{challenge}{nonce}".encode()).hexdigest()
+            if result.startswith(target):
+                print(f"[+] Challenge solved with nonce: {nonce}", file=sys.stderr)
+                return nonce
+
+    # Fallback: alphanumeric charset
+    alphanumeric = '0123456789abcdefghijklmnopqrstuvwxyz'
+    for length in range(1, 8):
+        for nonce_tuple in itertools.product(alphanumeric, repeat=length):
+            nonce = ''.join(nonce_tuple)
+            result = hashlib.sha256(f"{challenge}{nonce}".encode()).hexdigest()
+            if result.startswith(target):
+                print(f"[+] Challenge solved with nonce: {nonce}", file=sys.stderr)
+                return nonce
+
+    raise ValueError("Could not solve Anubis challenge")
+
+
+def handle_anubis_response(response, session):
+    """Check if response contains Anubis challenge and solve it.
+
+    Returns (should_retry,) tuple.
+    """
+    # Check for Anubis challenge in cookies
+    for cookie in response.cookies:
+        if cookie.name == '_anubis' and 'challenge' in cookie.value:
+            try:
+                parts = cookie.value.split('|')
+                challenge_val = None
+                difficulty = 16
+
+                for part in parts:
+                    if part.startswith('challenge:'):
+                        challenge_val = part.split(':', 1)[1]
+                    elif part.startswith('difficulty:'):
+                        difficulty = int(part.split(':', 1)[1])
+
+                if challenge_val:
+                    print(f"[*] Anubis challenge detected: {challenge_val[:20]}... (difficulty: {difficulty})", file=sys.stderr)
+                    nonce = solve_anubis_challenge(challenge_val, difficulty)
+                    session.cookies.set('_anubis', f'nonce:{nonce}', domain='aur.archlinux.org')
+                    return (True,)
+            except Exception as e:
+                print(f"[-] Failed to solve Anubis challenge: {e}", file=sys.stderr)
+                return (False,)
+
+    # Check for Anubis page content
+    if 'anubis' in response.url.lower() or 'proof-of-work' in response.text.lower():
+        challenge_match = re.search(r'challenge["\']?\s*[:=]\s*["\']([^"\']+)["\']', response.text)
+        if challenge_match:
+            challenge_val = challenge_match.group(1)
+            nonce = solve_anubis_challenge(challenge_val)
+            session.cookies.set('_anubis', f'nonce:{nonce}', domain='aur.archlinux.org')
+            return (True,)
+
+    return (False,)
+
+
+def smart_request(session, method, url, cookie_file=None, **kwargs):
+    """Make HTTP request with automatic Anubis challenge handling.
+
+    Retries up to 3 times if Anubis challenge is encountered.
+    Saves cookies to file after successfully solving a challenge.
+    """
+    max_retries = 3
+    solved_anubis = False
+    for attempt in range(max_retries):
+        try:
+            resp = session.request(method, url, **kwargs)
+        except requests.ConnectionError:
+            if attempt == max_retries - 1:
+                raise
+            continue
+
+        (should_retry,) = handle_anubis_response(resp, session)
+        if should_retry:
+            solved_anubis = True
+            if attempt < max_retries - 1:
+                print(f"[*] Retrying request (attempt {attempt + 1}/{max_retries})...", file=sys.stderr)
+                continue
+            else:
+                raise Exception("Max retries reached while solving Anubis challenge")
+
+        if solved_anubis and cookie_file:
+            save_cookies_to_file(session.cookies, cookie_file)
+            print(f"[*] Cookies saved to {cookie_file}", file=sys.stderr)
+
+        return resp
+
+    return resp
+
+
+def get_package_info(package_name):
+    """Fetch all information from an AUR package page and return structured data."""
+    session = create_session()
+
+    pkg_url = f"https://aur.archlinux.org/packages/{package_name}/"
+    resp = smart_request(session, 'get', pkg_url, cookie_file=COOKIE_FILE)
+
+    if resp.status_code != 200:
+        print(f"Error: Failed to fetch package page (HTTP {resp.status_code})", file=sys.stderr)
+        return None
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+
+    info = {
+        'name': package_name,
+        'metadata': {},
+        'dependencies': [],
+        'optional_dependencies': [],
+        'required_by': [],
+        'sources': [],
+        'pinned_comments': [],
+        'comments': [],
+    }
+
+    # --- Metadata table (#pkginfo) ---
+    table = soup.find('table', id='pkginfo')
+    if table:
+        for row in table.find_all('tr'):
+            th = row.find('th')
+            td = row.find('td')
+            if not th or not td:
+                continue
+            key = th.get_text(strip=True)
+            value = _extract_td_value(td, key)
+            # Normalize key names
+            key_map = {
+                'Git Clone URL:': 'git_clone_url',
+                'Package Base:': 'pkgbase',
+                'Description:': 'description',
+                'Upstream URL:': 'upstream_url',
+                'Licenses:': 'licenses',
+                'Conflicts:': 'conflicts',
+                'Provides:': 'provides',
+                'Replaces:': 'replaces',
+                'Submitter:': 'submitter',
+                'Maintainer:': 'maintainer',
+                'Last Packager:': 'last_packager',
+                'Votes:': 'votes',
+                'Popularity:': 'popularity',
+                'First Submitted:': 'first_submitted',
+                'Last Updated:': 'last_updated',
+                'Keyword:': 'keywords',
+            }
+            normalized = key_map.get(key, key.rstrip(':').lower().replace(' ', '_'))
+            info['metadata'][normalized] = value
+
+    # --- Flagged status ---
+    flagged_link = soup.find('a', string=lambda x: x and 'Flagged out-of-date' in x)
+    if flagged_link:
+        link_text = flagged_link.get_text(strip=True)
+        flag_date_match = re.search(r'\(([^)]+)\)', link_text)
+        info['metadata']['flagged_out_of_date'] = flag_date_match.group(1) if flag_date_match else True
+
+    # --- Dependencies (#pkgdepslist) ---
+    deps_list = soup.find('ul', id='pkgdepslist')
+    if deps_list:
+        for li in deps_list.find_all('li'):
+            dep = _extract_dep_info(li)
+            if dep:
+                if dep.get('optional'):
+                    info['optional_dependencies'].append(dep)
+                else:
+                    info['dependencies'].append(dep)
+
+    # --- Required by (#pkgreqs) ---
+    req_div = soup.find('div', id='pkgreqs')
+    if req_div:
+        req_h3 = req_div.find('h3')
+        if req_h3:
+            count_match = re.search(r'Required by \((\d+)\)', req_h3.get_text())
+            if count_match:
+                info['metadata']['required_by_count'] = int(count_match.group(1))
+        req_list = req_div.find('ul')
+        if req_list:
+            for li in req_list.find_all('li'):
+                link = li.find('a')
+                if link:
+                    info['required_by'].append(link.get_text(strip=True))
+
+    # --- Sources (#pkgsrcslist) ---
+    src_div = soup.find('div', id='pkgfiles')
+    if src_div:
+        src_h3 = src_div.find('h3')
+        if src_h3:
+            count_match = re.search(r'Sources?\s*\((\d+)\)', src_h3.get_text())
+            if count_match:
+                info['metadata']['source_count'] = int(count_match.group(1))
+        # Sources list may be a sibling div with ul#pkgsrcslist
+        for s in src_div.find_next_siblings():
+            if s.name == 'div' and 'comments' in str(s.get('class', [])):
+                break
+            if s.name:
+                ul = s.find('ul', id='pkgsrcslist')
+                if ul:
+                    for li in ul.find_all('li'):
+                        link = li.find('a')
+                        if link:
+                            info['sources'].append(link.get_text(strip=True))
+                    break
+
+    # --- Comments ---
+    # Pinned comments section (div.comments-header > h3 containing "Pinned Comments")
+    for header_div in soup.find_all('div', class_='comments-header'):
+        h3 = header_div.find('h3')
+        if not h3:
+            continue
+        h3_text = h3.get_text(strip=True)
+        if 'Pinned Comments' in h3_text:
+            info['pinned_comments'] = _extract_comments_from_section(header_div)
+        elif 'Latest Comments' in h3_text:
+            info['comments'] = _extract_comments_from_section(header_div)
+
+    return info
+
+
+def _extract_td_value(td, key):
+    """Extract a clean value from a metadata table td cell."""
+    if key == 'Git Clone URL:':
+        # Only return the URL, strip " (read-only, click to copy)"
+        link = td.find('a')
+        if link:
+            return link.get('href', '').strip()
+        text = td.get_text(strip=True)
+        return text.split('(')[0].strip() if '(' in text else text
+
+    if key == 'Package Base:':
+        link = td.find('a')
+        if link:
+            href = link.get('href', '')
+            # Extract pkgbase name from /pkgbase/<name>
+            return href.rstrip('/').split('/')[-1]
+        return td.get_text(strip=True)
+
+    if key == 'Maintainer:':
+        # Clean up whitespace and newlines
+        text = td.get_text()
+        # Normalize whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        # Remove "This package has been flagged as out of date." messages etc.
+        return text
+
+    # Check for links (URL fields, etc.)
+    links = td.find_all('a')
+    if links and len(links) == 1 and td.get_text(strip=True) == links[0].get_text(strip=True):
+        return links[0].get('href', '').strip()
+
+    text = td.get_text(strip=True)
+    if text:
+        return text
+
+    return ''
+
+
+def _extract_dep_info(li):
+    """Extract dependency name and optional info from a list item."""
+    link = li.find('a')
+    if not link:
+        return None
+    name = link.get_text(strip=True)
+
+    # Check if it has optdepends marker
+    em = li.find('em')
+    optional = False
+    opt_depends_on = None
+    if em:
+        em_text = em.get_text(strip=True)
+        if em_text.startswith('[') or em_text.startswith('(make)') or em_text.startswith('(check)'):
+            if '(make)' in em_text:
+                opt_depends_on = 'make'
+            elif '(check)' in em_text:
+                opt_depends_on = 'check'
+
+    return {
+        'name': name,
+        'optional': optional,
+        'dep_type': opt_depends_on,
+    }
+
+
+def _extract_comments_from_section(section_div):
+    """Extract all comments from a comments section (div.comments-header)."""
+    comments = []
+
+    # Find all h4.comment-header elements after this section div
+    for h4 in section_div.find_next_siblings('h4', class_='comment-header'):
+        heading_text = h4.get_text(strip=True)
+
+        # Extract author and date
+        author = None
+        date = "Unknown"
+        if 'commented on' in heading_text:
+            parts = heading_text.split('commented on', 1)
+            author = parts[0].strip()
+            date_part = parts[1].strip() if len(parts) > 1 else "Unknown"
+            date = re.sub(r'\(edited.*', '', date_part).strip()
+
+        if not author:
+            continue
+
+        # Find comment ID from parent element
+        comment_id = None
+        parent = h4.parent
+        if parent:
+            pid = parent.get('id', '')
+            if pid.startswith('comment-'):
+                comment_id = pid.split('-')[1]
+
+        # Find content in next sibling div.article-content
+        content = ""
+        next_elem = h4.find_next_sibling()
+        if next_elem and next_elem.name == 'div' and 'article-content' in next_elem.get('class', []):
+            content = next_elem.get_text(strip=True)
+
+        if not content:
+            continue
+
+        comments.append({
+            'id': comment_id,
+            'author': author,
+            'date': date,
+            'content': content[:500] + ('...' if len(content) > 500 else '')
+        })
+
+    return comments
+
+
+def get_flag_comment(package_name):
+    """Fetch flag comment for an AUR package (if flagged)."""
+    session = create_session()
+
+    pkg_url = f"https://aur.archlinux.org/packages/{package_name}/"
+    resp = smart_request(session, 'get', pkg_url, cookie_file=COOKIE_FILE)
+
+    if resp.status_code != 200:
+        print(f"Error: Failed to fetch package page (HTTP {resp.status_code})", file=sys.stderr)
+        return None
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+
+    flagged_link = soup.find('a', string=lambda x: x and 'Flagged out-of-date' in x)
+    if not flagged_link:
+        return None
+
+    link_text = flagged_link.get_text(strip=True)
+    flag_date_match = re.search(r'\(([^)]+)\)', link_text)
+    flag_date = flag_date_match.group(1) if flag_date_match else "Unknown"
+
+    flag_url = f"https://aur.archlinux.org{flagged_link['href']}"
+    flag_resp = smart_request(session, 'get', flag_url, cookie_file=COOKIE_FILE)
+
+    if flag_resp.status_code != 200:
+        print(f"Error: Failed to fetch flag comment page (HTTP {flag_resp.status_code})", file=sys.stderr)
+        return None
+
+    flag_soup = BeautifulSoup(flag_resp.text, 'html.parser')
+    content_div = flag_soup.find('div', id='content')
+
+    if not content_div:
+        return None
+
+    full_text = content_div.get_text()
+    lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if 'Flagged Out-of-Date Comment' in line:
+            start_idx = i + 1
+            break
+
+    relevant_lines = lines[start_idx:]
+
+    flag_info = {
+        'date': flag_date,
+        'url': flag_url
+    }
+
+    if not relevant_lines:
+        flag_info['flagged_by'] = None
+        flag_info['reason'] = "No reason provided"
+        return flag_info
+
+    first_line = relevant_lines[0]
+    flagged_by_match = re.match(r'([^\s]+)\s+flagged', first_line, re.IGNORECASE)
+    flag_info['flagged_by'] = flagged_by_match.group(1) if flagged_by_match else None
+
+    reason_lines = []
+    reason_start = False
+    for line in relevant_lines:
+        if 'for the following reason:' in line:
+            reason_start = True
+            continue
+        if reason_start:
+            if line.startswith('See:') or line.startswith('aurweb') or line.startswith('Copyright'):
+                break
+            reason_lines.append(line)
+
+    if reason_lines:
+        flag_info['reason'] = '\n'.join(reason_lines).strip()
+    else:
+        flag_info['reason'] = '\n'.join(relevant_lines[1:5]).strip() if len(relevant_lines) > 1 else first_line
+
+    return flag_info
+
+
+def search_by_co_maintainer(maintainer_name):
+    """Search AUR for packages where the given user is a co-maintainer."""
+    session = create_session()
+
+    search_url = "https://aur.archlinux.org/packages"
+    params = {'SeB': 'c', 'K': maintainer_name}
+
+    try:
+        resp = smart_request(session, 'get', search_url, params=params, timeout=10, cookie_file=COOKIE_FILE)
+        if resp.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        no_results = soup.find(string=lambda x: x and 'no packages' in x.lower())
+        if no_results:
+            return []
+
+        packages = []
+        results_div = soup.find('div', id='pkglist-results')
+        if not results_div:
+            return packages
+
+        table = results_div.find('table', class_='results')
+        if not table:
+            return packages
+
+        rows = table.find_all('tr')
+        for row in rows[1:]:
+            cols = row.find_all('td')
+            if len(cols) >= 6:
+                pkg_link = cols[0].find('a')
+                if pkg_link:
+                    pkg_name = pkg_link.get_text(strip=True)
+                    pkg_url = pkg_link.get('href', '')
+                    maintainer_text = cols[5].get_text(strip=True)
+
+                    packages.append({
+                        'package': pkg_name,
+                        'url': f"https://aur.archlinux.org{pkg_url}" if pkg_url.startswith('/') else pkg_url,
+                        'maintainer': maintainer_text
+                    })
+
+        return packages
+
+    except Exception as e:
+        print(f"Error searching AUR: {e}", file=sys.stderr)
+        return []
+
+
+def get_source(package_name, filepath="PKGBUILD"):
+    """Fetch a raw file from an AUR package via cgit plain endpoint.
+
+    Defaults to PKGBUILD. Can fetch any file in the package repo.
+    """
+    session = create_session()
+
+    # Resolve pkgbase: some packages share a pkgbase (split packages)
+    pkg_url = f"https://aur.archlinux.org/packages/{package_name}/"
+    resp = smart_request(session, 'get', pkg_url, cookie_file=COOKIE_FILE)
+
+    if resp.status_code != 200:
+        print(f"Error: Failed to fetch package page (HTTP {resp.status_code})", file=sys.stderr)
+        return None
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    pkgbase = None
+
+    # Look for pkgbase link in package actions
+    # Skip flagged out-of-date links (/pkgbase/<name>/flag-comment)
+    for pkgbase_link in soup.find_all('a', href=re.compile(r'/pkgbase/')):
+        href = pkgbase_link['href']
+        # The flag-comment link has 3 path components; the real pkgbase link has 2
+        parts = [p for p in href.split('/') if p]
+        if len(parts) == 2 and parts[0] == 'pkgbase':
+            pkgbase = parts[1]
+            break
+
+    if not pkgbase:
+        # Fallback: use package name as pkgbase
+        pkgbase = package_name
+
+    # Fetch raw file via cgit
+    raw_url = f"https://aur.archlinux.org/cgit/aur.git/plain/{filepath}?h={pkgbase}"
+    raw_resp = smart_request(session, 'get', raw_url, cookie_file=COOKIE_FILE)
+
+    if raw_resp.status_code != 200:
+        print(f"Error: Failed to fetch '{filepath}' for {pkgbase} (HTTP {raw_resp.status_code})", file=sys.stderr)
+        return None
+
+    return raw_resp.text
+
+
+def output_json(data):
+    """Output data as JSON."""
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def output_table_packages(packages):
+    """Output packages in human-readable table format."""
+    if not packages:
+        print("No packages found.")
+        return
+
+    for pkg in sorted(packages, key=lambda x: x['package']):
+        print(f"  {pkg['package']}")
+        print(f"   Maintainer: {pkg['maintainer']}")
+        print()
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='AUR CLI tool (read-only) - query package info, flag status, co-maintainers, and source files'
+    )
+    parser.add_argument(
+        'command',
+        choices=['get-info', 'get-flag-comment', 'search-by-co-maintainer', 'get-source'],
+        help='Command to execute'
+    )
+    parser.add_argument('--package', help='Package name (required for get-info, get-flag-comment, get-source)')
+    parser.add_argument('--maintainer', help='Maintainer name (required for search-by-co-maintainer)')
+    parser.add_argument('--file', default='PKGBUILD', help='File path to fetch (default: PKGBUILD, for get-source)')
+    parser.add_argument('--json', action='store_true', help='Output in JSON format')
+
+    args = parser.parse_args()
+
+    if args.command == 'get-info':
+        if not args.package:
+            print("Error: --package is required for get-info", file=sys.stderr)
+            sys.exit(1)
+
+        info = get_package_info(args.package)
+
+        if info is None:
+            sys.exit(1)
+
+        output_json(info)
+
+    elif args.command == 'get-flag-comment':
+        if not args.package:
+            print("Error: --package is required for get-flag-comment", file=sys.stderr)
+            sys.exit(1)
+
+        flag_info = get_flag_comment(args.package)
+
+        if not flag_info:
+            print(f"Package {args.package} is not flagged.")
+            sys.exit(0)
+
+        if args.json:
+            output_json(flag_info)
+        else:
+            print(f"\nFlag status for: {args.package}")
+            print(f"  Flagged on: {flag_info['date']}")
+            print(f"  Flagged by: {flag_info.get('flagged_by', 'Unknown')}")
+            print(f"  Reason: {flag_info.get('reason', 'No reason provided')}")
+            print()
+
+    elif args.command == 'search-by-co-maintainer':
+        if not args.maintainer:
+            print("Error: --maintainer is required for search-by-co-maintainer", file=sys.stderr)
+            sys.exit(1)
+
+        packages = search_by_co_maintainer(args.maintainer)
+
+        if args.json:
+            output_json(packages)
+        else:
+            print(f"\nPackages co-maintained by: {args.maintainer}")
+            print(f"Found {len(packages)} package(s):\n")
+            output_table_packages(packages)
+
+    elif args.command == 'get-source':
+        if not args.package:
+            print("Error: --package is required for get-source", file=sys.stderr)
+            sys.exit(1)
+
+        content = get_source(args.package, filepath=args.file)
+
+        if content is None:
+            sys.exit(1)
+
+        if args.json:
+            output_json({'package': args.package, 'file': args.file, 'content': content})
+        else:
+            print(content, end='')
+
+
+if __name__ == "__main__":
+    main()
