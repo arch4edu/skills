@@ -287,16 +287,17 @@ def get_package_info(package_name):
                     break
 
     # --- Comments ---
-    # Pinned comments section (div.comments-header > h3 containing "Pinned Comments")
-    for header_div in soup.find_all('div', class_='comments-header'):
-        h3 = header_div.find('h3')
-        if not h3:
-            continue
+    for h3 in soup.find_all('h3'):
         h3_text = h3.get_text(strip=True)
         if 'Pinned Comments' in h3_text:
-            info['pinned_comments'] = _extract_comments_from_section(header_div)
+            section = h3.find_parent('div', class_='comments-header')
+            if section:
+                info['pinned_comments'] = _extract_comments_from_section(section)
         elif 'Latest Comments' in h3_text:
-            info['comments'] = _extract_comments_from_section(header_div)
+            section = h3.find_parent('div', class_='comments-header')
+            if section:
+                info['comments'] = _extract_comments_from_section(section)
+                break  # Only need the latest comments section
 
     return info
 
@@ -374,6 +375,7 @@ def _extract_comments_from_section(section_div):
         heading_text = h4.get_text(strip=True)
 
         # Extract author and date
+        # Format: "username commented on YYYY-MM-DD HH:MM (UTC)"
         author = None
         date = "Unknown"
         if 'commented on' in heading_text:
@@ -383,7 +385,12 @@ def _extract_comments_from_section(section_div):
             date = re.sub(r'\(edited.*', '', date_part).strip()
 
         if not author:
-            continue
+            # Fallback: try to get username from link
+            link = h4.find('a')
+            if link and '/account/' in link.get('href', ''):
+                author = link.get_text(strip=True)
+            else:
+                continue
 
         # Find comment ID from parent element
         comment_id = None
