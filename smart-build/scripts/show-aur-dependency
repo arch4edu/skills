@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+简易版：显示包的 AUR 依赖
+- 不维护 pacman 数据库，直接读系统 pacman sync db
+- 无额外参数
+- 只列出 AUR 依赖
+"""
+
+import subprocess
+import requests
+import sys
+import logging
+import tarfile
+import argparse
+from pathlib import Path
+from collections import defaultdict
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger()
+
+def load_pacman_db():
+    """从系统 pacman sync 数据库加载包名、provides 映射，以及每个包在所有仓库中的分布"""
+    packages = set()
+    provides = {}
+    pkg_to_repos = defaultdict(set)  # 包名 → 仓库集合
+    
+    # 同步数据库路径
+    sync_dir = Path('/var/lib/pacman/sync')
+    
+    if not sync_dir.exists():
+        logger.error('Cannot find pacman sync directory')
+        sys.exit(1)
+    
+    logger.info(f'Reading pacman sync db from {sync_dir}')
+    
+    # 读取所有仓库（包括第三方仓库，如 arch4edu, archlinuxcn）
+    # 扫描 /var/lib/pacman/sync 目录下所有 .db 文件
+    db_files = list(sync_dir.glob('*.db'))
+    if not db_files:
+        logger.error('No pacman sync databases found')
+        sys.exit(1)
+    
+    for db_file in db_files:
+        repo = db_file.stem  # 从文件名提取仓库名（如 'arch4edu', 'archlinuxcn'）
+        try:
+            with tarfile.open(db_file, 'r:gz') as tar:
+                for member in tar.getmembers():
+                    if not member.name.endswith('/desc'):
+                        continue
+                    f = tar.extractfile(member)
+                    if not f:
+                        continue
+                    try:
+                        name = None
+                        in_provides = False
+                        for raw_line in f:
+                            line = raw_line.decode('utf-8', errors='ignore').strip()
+                            if line == '%NAME%':
+                                name_raw = f.readline()
+                                if name_raw:
+                                    name = name_raw.decode('utf-8', errors='ignore').strip()
+                                    if name:
+                                        packages.add(name)
+                                        pkg_to_repos[name].add(repo)
+                            elif line == '%PROVIDES%':
+                                in_provides = True
+                            elif in_provides:
+                                if line.startswith('%'):
+                                    break
+                                if line:
+                                    pname = line.split('=')[0].split('<')[0].split('>')[0].strip()
+                                    if pname and name:
+                                        provides[pname] = name
+                                        # provides 也记录仓库来源
+                                        if pname not in pkg_to_repos:
+                                            pkg_to_repos[pname] = set()
+                                        pkg_to_repos[pname].add(repo)
+                    finally:
+                        f.close()
+        except Exception as e:
+            logger.debug(f'Failed to read {db_file}: {e}')
+    
+    logger.info(f'Loaded {len(packages)} packages and {len(provides)} provides from {len(db_files)} repos')
+    return pkg_to_repos
+
+def get_aur_info(packages):
+    """从 AUR RPC 查询包信息"""
+    if not packages:
+        return {}
+    
+    AUR_URL = 'https://aur.archlinux.org/rpc/'
+    params = [('v', '5'), ('type', 'info')]
+    params.extend(('arg[]', pkg) for pkg in packages)
+    
+    try:
+        res = requests.get(AUR_URL, params=params, timeout=30)
+        data = res.json()
+        if data['type'] == 'error':
+            logger.error(f'AUR API error: {data.get("error", "Unknown error")}')
+            sys.exit(1)
+        results = {r['Name']: r for r in data['results']}
+        logger.info(f'Got AUR info for {len(results)} packages')
+        return results
+    except Exception as e:
+        logger.error(f'Failed to query AUR: {e}')
+        sys.exit(1)
+
+def parse_srcinfo_dep_types_from_string(srcinfo_content):
+    """从 SRCINFO 内容字符串解析依赖类型
+    
+    返回: dict mapping package name -> set of types: 'depends', 'makedepends', 'checkdepends'
+    """
+    dep_types = defaultdict(set)
+    
+    current_array = None
+    for line in srcinfo_content.splitlines():
+        line = line.strip()
+        if line.startswith('depends ='):
+            current_array = 'depends'
+            values = line.split('=', 1)[1].strip().split()
+        elif line.startswith('makedepends ='):
+            current_array = 'makedepends'
+            values = line.split('=', 1)[1].strip().split()
+        elif line.startswith('checkdepends ='):
+            current_array = 'checkdepends'
+            values = line.split('=', 1)[1].strip().split()
+        elif line.startswith('optdepends ='):
+            current_array = None  # 我们不关心 optdepends
+        elif line.startswith('=') or line.startswith('    '):
+            # Continuation line
+            if current_array:
+                values = line.strip().split()
+            else:
+                continue
+        else:
+            current_array = None
+            continue
+        
+        # Process values (they may contain version comparisons like 'python>=3.9')
+        for val in values:
+            # Strip version specifiers: >=, <=, =, <, >
+            pkg = val
+            for op in ['>=', '<=', '=', '<', '>']:
+                if op in pkg:
+                    pkg = pkg.split(op)[0].strip()
+            if pkg:
+                if current_array == 'depends':
+                    dep_types[pkg].add('depends')
+                elif current_array == 'makedepends':
+                    dep_types[pkg].add('makedepends')
+                elif current_array == 'checkdepends':
+                    dep_types[pkg].add('checkdepends')
+    
+    return dep_types
+
+def parse_srcinfo_dep_types(pkgname):
+    """调用 makepkg --printsrcinfo 解析依赖类型（使用当前目录）
+    
+    返回: dict mapping package name -> set of types: 'depends', 'makedepends', 'checkdepends'
+    """
+    try:
+        result = subprocess.run(
+            ['makepkg', '--printsrcinfo'],
+            cwd='.',
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            logger.warning(f'Failed to run makepkg --printsrcinfo: {result.stderr}')
+            return defaultdict(set)
+        
+        return parse_srcinfo_dep_types_from_string(result.stdout)
+    except Exception as e:
+        logger.warning(f'Failed to parse SRCINFO: {e}')
+        return defaultdict(set)
+
+def resolve_aur_dependencies(pkgname, pacman_packages, pkg_to_repos, aur_cache=None, use_local=False):
+    """解析包的依赖（仅直接依赖，不递归），标注来源和类型
+    
+    对于依赖：
+    - 如果官方仓库 (core/extra) 有，则跳过（视为已满足）
+    - 如果官方仓库没有，但第三方仓库有，则显示所有第三方仓库
+    - 如果任何仓库都没有，则是 AUR 依赖
+    
+    参数:
+        use_local: 如果 True，强制使用本地 PKGBUILD 而不是 AUR .SRCINFO
+    """
+    if aur_cache is None:
+        aur_cache = {}
+    
+    # 获取依赖列表和依赖类型
+    if use_local:
+        # 从本地 PKGBUILD 解析依赖（使用当前工作目录）
+        result = subprocess.run(
+            ['makepkg', '--printsrcinfo'],
+            cwd='.',  # 使用当前工作目录
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            logger.error(f'Failed to run makepkg --printsrcinfo: {result.stderr}')
+            return []
+        
+
+        # 解析 SRCINFO 获取依赖和类型
+        srcinfo = result.stdout
+        # 多包情况下只取全局依赖（第一个 pkgname 之前）
+        if srcinfo.count('pkgname =') > 1:
+            dep_type_map = defaultdict(set)
+            current_array = None
+            for line in srcinfo.splitlines():
+                line = line.strip()
+                if line.startswith('pkgname ='):
+                    break
+                if line.startswith('depends ='):
+                    current_array = 'depends'
+                    values = line.split('=', 1)[1].strip().split()
+                elif line.startswith('makedepends ='):
+                    current_array = 'makedepends'
+                    values = line.split('=', 1)[1].strip().split()
+                elif line.startswith('checkdepends ='):
+                    current_array = 'checkdepends'
+                    values = line.split('=', 1)[1].strip().split()
+                elif line.startswith('=') or line.startswith('    '):
+                    if current_array:
+                        values = line.strip().split()
+                    else:
+                        continue
+                else:
+                    current_array = None
+                    continue
+                for val in values:
+                    pkg = val
+                    for op in ['>=', '<=', '=', '<', '>']:
+                        if op in pkg:
+                            pkg = pkg.split(op)[0].strip()
+                    if pkg:
+                        if current_array == 'depends':
+                            dep_type_map[pkg].add('depends')
+                        elif current_array == 'makedepends':
+                            dep_type_map[pkg].add('makedepends')
+                        elif current_array == 'checkdepends':
+                            dep_type_map[pkg].add('checkdepends')
+        else:
+            dep_type_map = parse_srcinfo_dep_types_from_string(srcinfo)
+        all_deps = list(dep_type_map.keys())
+
+    else:
+        # 检查目标包是否在 AUR 中
+        if pkgname not in aur_cache:
+            info = get_aur_info([pkgname])
+            if pkgname not in info:
+                logger.warning(f'Package {pkgname} not found in AUR')
+                return []
+            aur_cache.update(info)
+        
+        info = aur_cache[pkgname]
+        
+        # 收集直接依赖
+        depends = info.get('Depends', [])
+        makedepends = info.get('MakeDepends', [])
+        checkdepends = info.get('CheckDepends', [])
+        all_deps = depends + makedepends + checkdepends
+        
+        # 从本地 SRCINFO 获取依赖类型标注（如果包在本地存在）
+        dep_type_map = parse_srcinfo_dep_types(pkgname)
+    
+    deps_with_source = []
+    
+    for dep in all_deps:
+        # 提取包名（去掉版本限制）
+        pkg = dep.split('<')[0].split('>')[0].split('=')[0].strip()
+        if not pkg:
+            continue
+        
+        # 直接使用原始包名查询仓库
+        # pkg_to_repos 已经包含了该包名所在的所有仓库（包括通过 provides 提供的）
+        repos = pkg_to_repos.get(pkg, set())
+        
+        # 检查是否有官方仓库 (core 或 extra)
+        if 'core' in repos or 'extra' in repos:
+            # 官方仓库已有，跳过（不显示）
+            continue
+        
+        if repos:
+            # 没有官方仓库，但有第三方仓库，显示所有第三方仓库
+            third_party_repos = sorted(repos)
+            repos_str = ', '.join(third_party_repos)
+            # 附加依赖类型标注（单独放在小括号外）
+            types = dep_type_map.get(pkg, set())
+            type_tags = []
+            if 'depends' in types:
+                type_tags.append('depends')
+            if 'makedepends' in types:
+                type_tags.append('makedepends')
+            if 'checkdepends' in types:
+                type_tags.append('checkdepends')
+            type_str = f' [{", ".join(type_tags)}]' if type_tags else ''
+            deps_with_source.append((pkg, f'available in {repos_str}', type_str))
+        else:
+            # 没有任何仓库提供 → AUR
+            types = dep_type_map.get(pkg, set())
+            type_tags = []
+            if 'depends' in types:
+                type_tags.append('depends')
+            if 'makedepends' in types:
+                type_tags.append('makedepends')
+            if 'checkdepends' in types:
+                type_tags.append('checkdepends')
+            type_str = f' [{", ".join(type_tags)}]' if type_tags else ''
+            deps_with_source.append((pkg, f'only available in AUR', type_str))
+    
+    # 去重并排序（按包名）
+    seen = set()
+    unique_deps = []
+    for pkg, source, type_str in sorted(deps_with_source):
+        if pkg not in seen:
+            seen.add(pkg)
+            unique_deps.append((pkg, source, type_str))
+    
+    return unique_deps
+
+def main():
+    parser = argparse.ArgumentParser(description='Show AUR dependencies for a package')
+    parser.add_argument('--local', action='store_true', default=True,
+                        help='Use local PKGBUILD (default: True, no AUR queries)')
+    # 保留 package 参数但标记为可选，用于向后兼容（但会被忽略）
+    parser.add_argument('package', nargs='?', help='Package name (ignored with --local)')
+    args = parser.parse_args()
+    
+    # 使用当前工作目录作为包目录
+    pkgname = args.package or Path.cwd().name
+    
+    # 加载 pacman 同步数据库（所有仓库）
+    pkg_to_repos = load_pacman_db()
+    
+    # 解析 AUR 依赖 - 默认使用本地 PKGBUILD
+    aur_deps = resolve_aur_dependencies(pkgname, set(), pkg_to_repos, use_local=args.local)
+    
+    # 输出结果
+    print(f'\nAUR dependencies for {pkgname}:')
+    if aur_deps:
+        for pkg, source, type_str in aur_deps:
+            print(f'  - {pkg} ({source}){type_str}')
+        print(f'\nTotal: {len(aur_deps)} non-official dependency(ies)')
+    else:
+        print('  All dependencies are available in official repos (core/extra)')
+
+if __name__ == '__main__':
+    main()
