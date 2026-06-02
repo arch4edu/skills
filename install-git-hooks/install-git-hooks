@@ -1,0 +1,58 @@
+#!/bin/bash
+# Install git hooks for notification (feishu/telegram via config.py)
+# Usage: bash install-git-hooks [force]
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)/scripts"
+FORCE=false
+if [ "$1" = "force" ]; then
+    FORCE=true
+fi
+
+# Check if we're in a git repository
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Error: Not in a git repository" >&2
+    exit 1
+fi
+
+HOOKS_DIR="$(git rev-parse --git-dir)/hooks"
+
+# Source files
+PRE_PUSH_SRC="$SCRIPT_DIR/pre-push"
+PRE_COMMIT_SRC="$SCRIPT_DIR/pre-commit"
+POST_COMMIT_SRC="$SCRIPT_DIR/post-commit"
+
+# Install a hook
+install_hook() {
+    local src="$1"
+    local name="$2"
+    local target="$HOOKS_DIR/$name"
+
+    if [ ! -f "$src" ]; then
+        echo "Warning: Source not found: $src"
+        return 1
+    fi
+
+    if [ -e "$target" ] && [ ! -L "$target" ]; then
+        echo "Warning: $target exists and is not a symlink, skipping"
+        return 1
+    fi
+
+    if [ -L "$target" ] && [ "$FORCE" = false ]; then
+        echo "Warning: $target already exists, use 'force' to overwrite"
+        return 1
+    fi
+
+    rm -f "$target"
+    ln -s "$src" "$target"
+    chmod +x "$target" 2>/dev/null || true
+    echo "✅ Installed $name -> $(basename "$src")"
+}
+
+install_hook "$PRE_PUSH_SRC" "pre-push"
+install_hook "$PRE_COMMIT_SRC" "pre-commit"
+install_hook "$POST_COMMIT_SRC" "post-commit"
+
+echo ""
+echo "🎉 All hooks installed!"

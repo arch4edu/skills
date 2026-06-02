@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""
+Pre-push hook with approval via interactive message + LLM Review.
+Platform-agnostic — uses whatever backend is configured in config.py.
+"""
+
+import sys
+import os
+import json
+import time
+import hashlib
+import requests
+import redis
+
+# Add script directory to path so hooks can find config.py and modules
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
+from config import (
+    notification_backend,
+    approval_timeout,
+    approval_poll_interval,
+    approval_progress_interval,
+    approval_emojis,
+    rejection_emojis,
+    llm_model,
+    llm_api_url,
+    llm_api_key,
+    llm_max_retries,
+    llm_retry_delay,
+    llm_cache_ttl,
+    review_prompt,
+    redis_host,
+    redis_port,
+    redis_db,
+    redis_password,
+    load_backend,
+)
+from git_helpers import get_git_diff, get_push_details, get_commit_author_name, get_commit_author_email, check_remote_ahead, count_commits_ahead
+
+# Load backend dynamically
+backend = load_backend()
+
+
+def get_redis_client():
+    """Get Redis client (lazy load, return None on failure)."""
+    try:
+        client = redis.Redis(
+            host=redis_host,
+            port=redis_port,
+            db=redis_db,
+            password=redis_password,
+            socket_timeout=2,
+            socket_connect_timeout=2
+        )
+        client.ping()
+        return client
+    except Exception as e:
+        print(f"[Redis] Connection failed: {e}")
+        return None
+
+
+def llm_review(diff_content):
+    """Review code changes via LLM API with Redis cache."""
+    print("[LLM] Starting code review...")
+
+    diff_hash = hashlib.sha256(diff_content.encode('utf-8')).hexdigest()[:16]
+    cache_key = f"llm_review:{diff_hash}"
+
+    r = get_redis_client()
+    if r:
+        try:
+            cached = r.get(cache_key)
+            if cached:
+                cached_data = json.loads(cached)
+                print(f"[LLM] Cache hit! TTL: {r.ttl(cache_key)}s")
+                return cached_data.get('result', 'accept'), cached_data.get('reason', 'Cached result'), True
+        except Exception as e:
+            print(f"[Redis] Cache read error: {e}")
+
+    headers = {
+        "Authorization": f"Bearer {llm_api_key}",
+        "Content-Type": "application/json"
+    }
+
+    messages = [
+        {"role": "system", "content": "你是一位严格的代码审查专家。请仔细审查代码改动并给出客观评价。"},
+        {"role": "user", "content": review_prompt + diff_content}
+    ]
+
+    payload = {
+        "model": llm_model,
+        "messages": messages,
+        "max_tokens": 512,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"}
+    }
+
+    last_error = None
+
+    for attempt in range(llm_max_retries):
+        try:
+            response = requests.post(llm_api_url, headers=headers, json=payload, timeout=60)
+            data = response.json()
+
+            if 'choices' in data and len(data['choices']) > 0:
+                content = data['choices'][0]['message']['content']
+                print(f"[LLM] Raw response: {content[:500]}")
+
+                content = content.strip()
+                if content.startswith('```json'):
+                    content = content[7:]
+                elif content.startswith('```'):
+                    content = content[3:]
+                if content.endswith('```'):
+                    content = content[:-3]
+                content = content.strip()
+
+                result = json.loads(content)
+                final_result = result.get('result', 'reject'), result.get('reason', 'No reason provided')
+
+                if r:
+                    try:
+                        cache_data = {
+                            'result': final_result[0],
+                            'reason': final_result[1]
+                        }
+                        r.setex(cache_key, llm_cache_ttl, json.dumps(cache_data))
+                        print(f"[LLM] Cached result with TTL {llm_cache_ttl}s")
+                    except Exception as e:
+                        print(f"[Redis] Cache write error: {e}")
+
+                return final_result[0], final_result[1], False
+            else:
+                print(f"[LLM] Attempt {attempt + 1}/{llm_max_retries} - Error response: {data}")
+                last_error = str(data)
+
+        except json.JSONDecodeError as e:
+            print(f"[LLM] Attempt {attempt + 1}/{llm_max_retries} - JSON parse error: {e}")
+            last_error = f"JSON parse error: {e}"
+        except requests.exceptions.Timeout:
+            print(f"[LLM] Attempt {attempt + 1}/{llm_max_retries} - Timeout")
+            last_error = "Request timeout"
+        except Exception as e:
+            print(f"[LLM] Attempt {attempt + 1}/{llm_max_retries} - Exception: {e}")
+            last_error = str(e)
+
+        if attempt < llm_max_retries - 1:
+            print(f"[LLM] Retrying in {llm_retry_delay} seconds...")
+            time.sleep(llm_retry_delay)
+
+    print(f"[LLM] All {llm_max_retries} attempts failed. Allowing by default.")
+    return "accept", f"LLM review failed after {llm_max_retries} attempts: {last_error}", False
+
+
+def wait_for_approval_feishu(backend, msg_id, token, author_name):
+    """Poll for approval/rejection reactions (Feishu). Returns True/False/None."""
+    start_time = time.time()
+    approved = None
+    bot_reacted = set()
+
+    while time.time() - start_time < approval_timeout:
+        time.sleep(approval_poll_interval)
+        reactions = backend.list_reactions(token, msg_id)
+        user_reactions = [r for r in reactions if r.get('operator', {}).get('operator_type') == 'user']
+        user_reaction_types = [r.get('reaction_type', {}).get('emoji_type', '') for r in user_reactions]
+
+        for rt in user_reaction_types:
+            if rt not in bot_reacted:
+                backend.add_reaction(token, msg_id, rt)
+                bot_reacted.add(rt)
+                print(f"👀 Acknowledged: {rt}")
+
+        if any(rt in approval_emojis for rt in user_reaction_types):
+            print(f"✅ Push approved via {notification_backend}")
+            approved = True
+            break
+        rejection_list = [rt for rt in user_reaction_types if rt in rejection_emojis]
+        if rejection_list:
+            emoji_str = ', '.join(set(rejection_list))
+            print(f"❌ Push rejected via {notification_backend} (rejection emojis: {emoji_str})")
+            reject_user = user_reactions[0].get('operator', {}).get('operator_id', 'unknown')
+            print(f"Hi, {author_name}. Your push was rejected by User {reject_user}. Don't try to push again immediately. Please ask your user what needs to be fixed.")
+            approved = False
+            break
+
+        elapsed = int(time.time() - start_time)
+        if elapsed % approval_progress_interval == 0:
+            print(f"Waiting for approval... ({elapsed}s)")
+
+    if approved is None:
+        print("⏱️ Timeout waiting for approval")
+        try:
+            backend.add_reaction(token, msg_id, 'Alarm')
+        except:
+            pass
+        print(f"Hi, {author_name}. Your push approval request timed out. Don't push again immediately.")
+        print("❌ Rejected due to timeout.")
+        return None
+
+    return approved
+
+
+def wait_for_approval_telegram(backend, msg_id, token, author_name, chat_id):
+    """
+    Wait for approval via Telegram inline keyboard callback queries.
+    Updates the message buttons to reflect the decision (auto-change after click).
+    Returns True/False/None.
+    """
+    cb_id, callback_data, from_user_id = backend.poll_callback(
+        msg_id, chat_id, timeout=approval_timeout, poll_interval=approval_poll_interval
+    )
+
+    if cb_id is None:
+        # Timeout
+        print("⏱️ Timeout waiting for approval")
+        print(f"Hi, {author_name}. Your push approval request timed out. Don't push again immediately.")
+        print("❌ Rejected due to timeout.")
+
+        # Update message to show timeout, remove buttons
+        try:
+            backend.edit_message_text(
+                chat_id, msg_id,
+                "⏱️ **Push 审批超时**\n\n请求已过期，请重新推送。",
+                reply_markup=None
+            )
+        except:
+            pass
+        return None
+
+    # Answer the callback query
+    if callback_data == 'approve':
+        backend.answer_callback_query(cb_id, text="✅ Push approved!")
+        print(f"✅ Push approved via {notification_backend} (user {from_user_id})")
+        approved = True
+    elif callback_data == 'reject':
+        backend.answer_callback_query(cb_id, text="❌ Push rejected!", show_alert=True)
+        print(f"❌ Push rejected via {notification_backend} (user {from_user_id})")
+        print(f"Hi, {author_name}. Your push was rejected by User {from_user_id}. Don't try to push again immediately. Please ask your user what needs to be fixed.")
+        approved = False
+    else:
+        backend.answer_callback_query(cb_id, text="Unknown action")
+        print(f"⚠️ Unknown callback: {callback_data}")
+        return None
+
+    # Update message to reflect the decision — buttons auto-change to show result
+    if approved:
+        new_text = "✅ **Push 已批准**\n\n用户已批准此次推送。"
+        print("✅ Approved. Proceeding with push.")
+    else:
+        new_text = "❌ **Push 已拒绝**\n\n用户已拒绝此次推送。"
+        print("❌ Rejected.")
+
+    try:
+        backend.edit_message_text(chat_id, msg_id, new_text, reply_markup=None)
+    except Exception as e:
+        print(f"[Telegram] Failed to update message: {e}")
+
+    return approved
+
+
+def wait_for_approval(backend, msg_id, token, author_name, chat_id=None):
+    """Dispatch to the appropriate approval wait method based on backend."""
+    if notification_backend == "telegram":
+        return wait_for_approval_telegram(backend, msg_id, token, author_name, chat_id)
+    else:
+        return wait_for_approval_feishu(backend, msg_id, token, author_name)
+
+
+def main():
+    email = get_commit_author_email()
+    if not email:
+        sys.exit(0)
+
+    remote_url, repo_name, default_branch = get_push_details()
+    _, git_diff = get_git_diff()
+    author_name = get_commit_author_name()
+
+    # Check remote
+    print(f"Checking remote for updates (default branch: {default_branch})...")
+    ok, msg = check_remote_ahead(default_branch)
+    if not ok:
+        print(f"❌ {msg}")
+        print("❌ Rejected due to remote updates.")
+        sys.exit(1)
+
+    # Check single commit
+    commits = count_commits_ahead(default_branch)
+    if len(commits) > 1:
+        print(f"❌ Multiple commits ({len(commits)}) to push. Rejecting.")
+        print("   Please merge into one commit or push one at a time.")
+        print("❌ Rejected due to multiple commits.")
+        sys.exit(1)
+
+    # ===== LLM review =====
+    print(f"[LLM] Running code review on {len(git_diff)} chars of diff...")
+    llm_result, llm_reason, is_cached = llm_review(git_diff)
+    print(f"[LLM] Review result: {llm_result}" + (" (cached)" if is_cached else ""))
+    if llm_result == "reject":
+        print(f"[LLM] Rejected: {llm_reason}")
+        try:
+            backend.send_rejection(repo_name, git_diff, llm_reason, is_cached)
+        except Exception as e:
+            print(f"Failed to send rejection notification: {e}")
+        print("❌ Rejected by LLM review.")
+        sys.exit(1)
+    else:
+        print(f"[LLM] Accepted" + (" (from cache)" if is_cached else ""))
+
+    print(f"Pre-push: Detected push to {repo_name}. Requesting {notification_backend} approval...")
+
+    try:
+        msg_id, chat_id, token = backend.send_approval_request(repo_name, git_diff, is_cached)
+        print(f"Sent notification: {msg_id}")
+
+        try:
+            backend.urgent(token, msg_id)
+        except:
+            pass
+    except Exception as e:
+        print(f"Failed to send notification: {e}")
+        sys.exit(1)
+
+    # Wait for approval
+    approved = wait_for_approval(backend, msg_id, token, author_name, chat_id)
+
+    if approved is None:
+        sys.exit(1)
+    elif approved:
+        # Feishu: add checkmark reaction; Telegram: already handled in wait_for_approval_telegram
+        if notification_backend != "telegram":
+            try:
+                backend.add_reaction(token, msg_id, 'CheckMark')
+            except:
+                pass
+        print("✅ Approved. Proceeding with push.")
+        sys.exit(0)
+    else:
+        # Feishu: add crossmark reaction; Telegram: already handled in wait_for_approval_telegram
+        if notification_backend != "telegram":
+            try:
+                backend.add_reaction(token, msg_id, 'CrossMark')
+            except:
+                pass
+        print("❌ Rejected.")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
