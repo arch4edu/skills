@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""
+Shared configuration for git hooks.
+Copy this file to config.py and fill in your credentials.
+
+Generated from: config.py.example
+"""
+
+# ── Git diff limits ────────────────────────────────────────────────────────
+max_diff_bytes = 30000
+
+# ── Approval timeout ───────────────────────────────────────────────────────
+approval_timeout = 120  # seconds
+approval_poll_interval = 3  # seconds
+approval_progress_interval = 15  # seconds
+
+# ── Approval emojis ────────────────────────────────────────────────────────
+approval_emojis = {'CheckMark', 'OK', 'ThumbsUp', 'Yes'}
+rejection_emojis = {'CrossMark', 'NO', 'ThumbsDown', 'No'}
+
+# ── LLM review config ─────────────────────────────────────────────────────
+llm_model = "qwen3.7-max"
+llm_api_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+llm_api_key = ""  # DashScope API key (sk-...)
+llm_max_retries = 3
+llm_retry_delay = 2  # seconds
+llm_cache_ttl = 3600  # seconds
+
+review_prompt = """你是一位代码改动审查专家。请遵循以下规则审查代码：
+
+1. commit message 必须只有一行
+2. commit message 和改动是否匹配
+3. 改动是否是正确、合理的
+4. 是否有多余的、不必要的改动
+5. 是否有可以去掉的注释改动
+6. 改动是否已经最小化
+
+特别说明：
+- nvchecker 的 aur 字段允许填空，即 "aur: " 是合理的。
+
+请按照 JSON 格式给出回复：
+```json
+{
+  "result": "accept" 或 "reject",
+  "reason": "当 result 为 reject 时，说明原因"
+}
+```
+
+以下是代码改动：
+"""
+
+# ── Notification backend ──────────────────────────────────────────────────
+# Which platform to use for notifications: 'feishu' or 'telegram'
+notification_backend = "feishu"
+
+# ── Feishu config ─────────────────────────────────────────────────────────
+# Get these from your Feishu app (https://open.feishu.cn/)
+feishu_app_id = "cli_xxx"
+feishu_app_secret = "xxx"
+feishu_dest = "ou_xxx"  # open_id or chat_id
+
+# ── Telegram config ───────────────────────────────────────────────────────
+# Get from @BotFather: /newbot → bot_token
+# Send a message to your bot, then visit:
+#   https://api.telegram.org/bot<TOKEN>/getUpdates → find chat.id
+telegram_bot_token = ""  # e.g. "123456:ABC-DEF..."
+telegram_chat_id = ""    # e.g. "123456789"
+telegram_allow_from = []  # empty = allow all, or [user_id1, user_id2]
+
+# ── Redis config (optional) ───────────────────────────────────────────────
+redis_host = "127.0.0.1"
+redis_port = 6379
+redis_db = 0
+redis_password = None
+
+
+# ── Helper functions ──────────────────────────────────────────────────────
+
+def get_receive_id_type(chat_id: str) -> str:
+    """Determine receive_id_type from chat ID prefix (Feishu-specific)."""
+    return 'open_id' if chat_id.startswith('ou_') else 'chat_id'
+
+
+def load_backend():
+    """Dynamically load the notification backend module based on config."""
+    if notification_backend == "feishu":
+        import feishu_api as backend
+    elif notification_backend == "telegram":
+        import telegram_api as backend
+    else:
+        raise ValueError(f"Unknown notification_backend: {notification_backend}")
+    return backend

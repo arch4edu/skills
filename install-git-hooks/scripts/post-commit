@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""
+Post-commit hook: send commit diff notification.
+No approval needed, just notification. Platform-agnostic.
+"""
+
+import sys
+import os
+
+# Add script directory to path
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
+from config import max_diff_bytes, load_backend
+from git_helpers import get_git_diff, get_repo_info
+
+backend = load_backend()
+
+
+def main():
+    commit_hash, diff = get_git_diff(max_diff_bytes)
+    if not commit_hash:
+        print("❌ Could not get commit info")
+        sys.exit(1)
+
+    repo_name, current_branch, remote_name = get_repo_info()
+    print(f"[POST-COMMIT] Repo: {repo_name}, Branch: {current_branch}, Remote: {remote_name}, Commit: {commit_hash[:8]}")
+
+    # Build branch info
+    if current_branch and (remote_name != "origin" or current_branch not in ("master", "main")):
+        branch_info = f" | {remote_name}/{current_branch}"
+    else:
+        branch_info = ""
+
+    text = f"**📝 Commit 完成 | {repo_name}{branch_info}**\n\n```\n{diff}\n```"
+
+    try:
+        backend.send_notification(text)
+    except Exception as e:
+        print(f"❌ Failed to send notification: {e}")
+        sys.exit(1)
+
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
