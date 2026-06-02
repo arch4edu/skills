@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+#
+# Smart build script for arch4edu packages — foreground, no tmux, no hook
+#
+# Usage:
+#   smart-x86_64-build
+#
+# Features:
+# - Analyzes dependencies using show-aur-dependency (local PKGBUILD)
+# - Selects appropriate build tool based on dependency availability
+# - Runs build in foreground (no tmux)
+# - Logs output to auto-incremented file: build-v1.log, build-v2.log, etc.
+# - Determines success by checking for "==> Running checkpkg" in log
+
+set -euo pipefail
+
+# Resolve script directory and prefer bundled helpers
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="${SCRIPT_DIR}:${PATH}"
+
+# Check if running in an allowed directory (whitelist mode)
+CURRENT_DIR="$(pwd)"
+HOME_DIR="${HOME}"
+ALLOWED_PATHS=(
+    "${HOME_DIR}/aur"
+)
+CURRENT_DIR_REAL="$(realpath -m "${CURRENT_DIR}")"
+ALLOWED=false
+for ALLOWED_PATH in "${ALLOWED_PATHS[@]}"; do
+    if [[ "${CURRENT_DIR_REAL}" == "${ALLOWED_PATH}" ]] || [[ "${CURRENT_DIR_REAL}" == "${ALLOWED_PATH}"/* ]]; then
+        ALLOWED=true
+        break
+    fi
+done
+if [[ "${ALLOWED}" == false ]]; then
+    echo "❌ Error: This script can only be run from specific directories"
+    echo ""
+    echo "Allowed directories (and subdirectories):"
+    echo "  - ${HOME_DIR}/aur"
+    echo ""
+    echo "Current directory: ${CURRENT_DIR}"
+    echo ""
+    exit 1
+fi
+
+# Check if PKGBUILD exists
+if [[ ! -f "PKGBUILD" ]]; then
+    echo "❌ Error: No PKGBUILD found in current directory"
+    exit 1
+fi
+
+# Extract package identifier from PKGBUILD
+# Prefer pkgbase if it exists, otherwise use pkgname
+if PKGBASE=$(makepkg --printsrcinfo 2>/dev/null | grep -E '^pkgbase = ' | head -1 | cut -d= -f2- | tr -d " '"); then
+    PKGNAME="${PKGBASE}"
+else
+    if ! PKGNAME=$(makepkg --printsrcinfo 2>/dev/null | grep -E '^pkgname = ' | head -1 | cut -d= -f2- | tr -d " '"); then
+        echo "❌ Error: Could not extract pkgname or pkgbase from PKGBUILD"
+        exit 1
+    fi
+fi
+
+echo "🔍 Analyzing dependencies for ${PKGNAME}..."
+
+# Run show-aur-dependency
+if ! DEPENDENCIES=$(show-aur-dependency 2>&1); then
+    echo "❌ Error: Failed to analyze dependencies"
+    echo "${DEPENDENCIES}"
+    exit 1
+fi
+
+# Determine build tool
+readarray -t DEP_LINES < <(echo "${DEPENDENCIES}" | grep -E '^  - ')
+
+# Check if we should ignore checkdepends due to --nocheck
+if [[ "${SMART_BUILD_NOCHECK:-}" == "1" || "${SMART_BUILD_NOCHECK:-}" == "true" ]]; then
+    FILTERED_DEP_LINES=()
+    for line in "${DEP_LINES[@]}"; do
+        if ! echo "${line}" | grep -q '\[checkdepends\]'; then
+            FILTERED_DEP_LINES+=("${line}")
+        fi
+    done
+    DEP_LINES=("${FILTERED_DEP_LINES[@]}")
+fi
+
+if [[ ${#DEP_LINES[@]} -eq 0 ]]; then
+    BUILD_TOOL="extra-x86_64-build"
+    echo "✅ No AUR dependencies detected"
+    echo "   Build tool: ${BUILD_TOOL}"
+else
+    ALL_IN_ARCH4EDU=true
+    MISSING=()
+    for line in "${DEP_LINES[@]}"; do
+        if ! echo "${line}" | grep -q 'arch4edu'; then
+            MISSING+=("${line}")
+            ALL_IN_ARCH4EDU=false
+        fi
+    done
+
+    if [[ "${ALL_IN_ARCH4EDU}" == true ]]; then
+        BUILD_TOOL="arch4edu-x86_64-build"
+        echo "✅ All AUR dependencies available in arch4edu"
+        echo "   Build tool: ${BUILD_TOOL}"
+    else
+        echo "❌ Error: Some AUR dependencies are not available in arch4edu:"
+        for line in "${MISSING[@]}"; do
+            echo "   ${line}"
+        done
+        echo ""
+        echo "Cannot build: All AUR dependencies must be available in arch4edu repository."
+        exit 1
+    fi
+fi
+
+# Auto-increment version detection for log file
+MAX_VER=0
+for f in build-v*.log; do
+    if [[ -f "$f" ]]; then
+        if [[ "$f" =~ build-v([0-9]+)\.log$ ]]; then
+            ver="${BASH_REMATCH[1]}"
+            if [[ $ver -gt $MAX_VER ]]; then
+                MAX_VER=$ver
+            fi
+        fi
+    fi
+done
+NEXT_VER=$((MAX_VER + 1))
+LOG_FILE="build-v${NEXT_VER}.log"
+
+# Backup PKGBUILD with version suffix
+cp "PKGBUILD" "PKGBUILD.bak${NEXT_VER}"
+echo "💾 Backed up PKGBUILD to PKGBUILD.bak${NEXT_VER}"
+
+echo "🚀 Starting smart build..."
+echo "   Package: ${PKGNAME}"
+echo "   Tool: ${BUILD_TOOL}"
+echo "   Log: ${LOG_FILE}"
+
+# Prepare makepkg arguments
+MAKEPKG_ARGS=""
+if [[ "${SMART_BUILD_NOCHECK:-}" == "1" || "${SMART_BUILD_NOCHECK:-}" == "true" ]]; then
+    MAKEPKG_ARGS="--nocheck"
+    echo "⚠️  Skip check phase (--nocheck)"
+else
+    echo "ℹ️  Full build (with archive generation)"
+fi
+
+# Build command (foreground, piped to log)
+if [[ -n "${MAKEPKG_ARGS}" ]]; then
+    BUILD_CMD="${BUILD_TOOL} -- -- ${MAKEPKG_ARGS} 2>&1 | tee \"${LOG_FILE}\""
+else
+    BUILD_CMD="${BUILD_TOOL} 2>&1 | tee \"${LOG_FILE}\""
+fi
+
+# Execute build in foreground
+eval "${BUILD_CMD}"
+
+# Determine success/failure by checking for "==> Running checkpkg" in log
+if grep -q '==> Running checkpkg' "${LOG_FILE}"; then
+    # Success - truncate log but KEEP the checkpkg line
+    awk '/==> Running checkpkg/ {print; exit} {print}' "${LOG_FILE}" > "${LOG_FILE}.tmp"
+    mv "${LOG_FILE}.tmp" "${LOG_FILE}"
+    echo "✅ Build succeeded: ${PKGNAME} (${LOG_FILE})"
+    exit 0
+else
+    # Failure
+    echo "❌ Build failed: No success marker found in log"
+    exit 1
+fi
