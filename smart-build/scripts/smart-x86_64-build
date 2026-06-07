@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Smart build script for arch4edu packages — foreground, no tmux, no hook
+# Smart build script for arch4edu packages — tmux window, auto-close on finish
 #
 # Usage:
 #   smart-x86_64-build
@@ -8,7 +8,7 @@
 # Features:
 # - Analyzes dependencies using show-aur-dependency (local PKGBUILD)
 # - Selects appropriate build tool based on dependency availability
-# - Runs build in foreground (no tmux)
+# - Runs build in a tmux "build" session window (auto-closes on finish)
 # - Logs output to auto-incremented file: build-v1.log, build-v2.log, etc.
 # - Determines success by checking for "==> Running checkpkg" in log
 
@@ -145,25 +145,18 @@ else
     echo "ℹ️  Full build (with archive generation)"
 fi
 
-# Build command (foreground, piped to log)
+# Build command
 if [[ -n "${MAKEPKG_ARGS}" ]]; then
-    BUILD_CMD="${BUILD_TOOL} -- -- ${MAKEPKG_ARGS} 2>&1 | tee \"${LOG_FILE}\""
+    BUILD_CMD="${BUILD_TOOL} -- -- ${MAKEPKG_ARGS} 2>&1 | tee '${LOG_FILE}'"
 else
-    BUILD_CMD="${BUILD_TOOL} 2>&1 | tee \"${LOG_FILE}\""
+    BUILD_CMD="${BUILD_TOOL} 2>&1 | tee '${LOG_FILE}'"
 fi
 
-# Execute build in foreground
-eval "${BUILD_CMD}"
+# Success/failure detection command (runs after build inside tmux)
+CHECK_CMD="if grep -q '==> Running checkpkg' '${LOG_FILE}'; then awk '/==> Running checkpkg/ {print; exit} {print}' '${LOG_FILE}' > '${LOG_FILE}.tmp' && mv '${LOG_FILE}.tmp' '${LOG_FILE}' && echo '✅ Build succeeded: ${PKGNAME} (${LOG_FILE})'; else echo '❌ Build failed: No success marker found in log'; fi"
 
-# Determine success/failure by checking for "==> Running checkpkg" in log
-if grep -q '==> Running checkpkg' "${LOG_FILE}"; then
-    # Success - truncate log but KEEP the checkpkg line
-    awk '/==> Running checkpkg/ {print; exit} {print}' "${LOG_FILE}" > "${LOG_FILE}.tmp"
-    mv "${LOG_FILE}.tmp" "${LOG_FILE}"
-    echo "✅ Build succeeded: ${PKGNAME} (${LOG_FILE})"
-    exit 0
-else
-    # Failure
-    echo "❌ Build failed: No success marker found in log"
-    exit 1
-fi
+# Launch in tmux window (auto-closes on finish)
+tmux new-window -t build -n "${PKGNAME}-v${NEXT_VER}" -c "${CURRENT_DIR}" "${BUILD_CMD}; ${CHECK_CMD}"
+echo "📦 Build launched in tmux session 'build', window '${PKGNAME}-v${NEXT_VER}'"
+echo "   Attach: tmux attach -t build"
+echo "   Log: ${LOG_FILE} (will be written in ${CURRENT_DIR})"
