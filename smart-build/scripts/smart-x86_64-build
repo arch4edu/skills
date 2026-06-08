@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Smart build script for arch4edu packages — tmux window, auto-close on finish
+# Smart build script for arch4edu packages - tmux window, auto-close on finish
 #
 # Usage:
 #   smart-x86_64-build
@@ -33,7 +33,7 @@ for ALLOWED_PATH in "${ALLOWED_PATHS[@]}"; do
     fi
 done
 if [[ "${ALLOWED}" == false ]]; then
-    echo "❌ Error: This script can only be run from specific directories"
+    echo "[ERROR] This script can only be run from specific directories"
     echo ""
     echo "Allowed directories (and subdirectories):"
     echo "  - ${HOME_DIR}/aur"
@@ -45,7 +45,7 @@ fi
 
 # Check if PKGBUILD exists
 if [[ ! -f "PKGBUILD" ]]; then
-    echo "❌ Error: No PKGBUILD found in current directory"
+    echo "[ERROR] No PKGBUILD found in current directory"
     exit 1
 fi
 
@@ -55,16 +55,16 @@ if PKGBASE=$(makepkg --printsrcinfo 2>/dev/null | grep -E '^pkgbase = ' | head -
     PKGNAME="${PKGBASE}"
 else
     if ! PKGNAME=$(makepkg --printsrcinfo 2>/dev/null | grep -E '^pkgname = ' | head -1 | cut -d= -f2- | tr -d " '"); then
-        echo "❌ Error: Could not extract pkgname or pkgbase from PKGBUILD"
+        echo "[ERROR] Could not extract pkgname or pkgbase from PKGBUILD"
         exit 1
     fi
 fi
 
-echo "🔍 Analyzing dependencies for ${PKGNAME}..."
+echo "Analyzing dependencies for ${PKGNAME}..."
 
 # Run show-aur-dependency
 if ! DEPENDENCIES=$(show-aur-dependency 2>&1); then
-    echo "❌ Error: Failed to analyze dependencies"
+    echo "[ERROR] Failed to analyze dependencies"
     echo "${DEPENDENCIES}"
     exit 1
 fi
@@ -85,7 +85,7 @@ fi
 
 if [[ ${#DEP_LINES[@]} -eq 0 ]]; then
     BUILD_TOOL="extra-x86_64-build"
-    echo "✅ No AUR dependencies detected"
+    echo "[OK] No AUR dependencies detected"
     echo "   Build tool: ${BUILD_TOOL}"
 else
     ALL_IN_ARCH4EDU=true
@@ -99,10 +99,10 @@ else
 
     if [[ "${ALL_IN_ARCH4EDU}" == true ]]; then
         BUILD_TOOL="arch4edu-x86_64-build"
-        echo "✅ All AUR dependencies available in arch4edu"
+        echo "[OK] All AUR dependencies available in arch4edu"
         echo "   Build tool: ${BUILD_TOOL}"
     else
-        echo "❌ Error: Some AUR dependencies are not available in arch4edu:"
+        echo "[ERROR] Some AUR dependencies are not available in arch4edu:"
         for line in "${MISSING[@]}"; do
             echo "   ${line}"
         done
@@ -129,9 +129,9 @@ LOG_FILE="build-v${NEXT_VER}.log"
 
 # Backup PKGBUILD with version suffix
 cp "PKGBUILD" "PKGBUILD.bak${NEXT_VER}"
-echo "💾 Backed up PKGBUILD to PKGBUILD.bak${NEXT_VER}"
+echo "Backed up PKGBUILD to PKGBUILD.bak${NEXT_VER}"
 
-echo "🚀 Starting smart build..."
+echo "Starting smart build..."
 echo "   Package: ${PKGNAME}"
 echo "   Tool: ${BUILD_TOOL}"
 echo "   Log: ${LOG_FILE}"
@@ -140,9 +140,9 @@ echo "   Log: ${LOG_FILE}"
 MAKEPKG_ARGS=""
 if [[ "${SMART_BUILD_NOCHECK:-}" == "1" || "${SMART_BUILD_NOCHECK:-}" == "true" ]]; then
     MAKEPKG_ARGS="--nocheck"
-    echo "⚠️  Skip check phase (--nocheck)"
+    echo "[WARN] Skip check phase (--nocheck)"
 else
-    echo "ℹ️  Full build (with archive generation)"
+    echo "[INFO] Full build (with archive generation)"
 fi
 
 # Build command
@@ -153,10 +153,14 @@ else
 fi
 
 # Success/failure detection command (runs after build inside tmux)
-CHECK_CMD="if grep -q '==> Running checkpkg' '${LOG_FILE}'; then awk '/==> Running checkpkg/ {print; exit} {print}' '${LOG_FILE}' > '${LOG_FILE}.tmp' && mv '${LOG_FILE}.tmp' '${LOG_FILE}' && echo '✅ Build succeeded: ${PKGNAME} (${LOG_FILE})'; else echo '❌ Build failed: No success marker found in log'; fi"
+CHECK_CMD="if grep -q '==> Running checkpkg' '${LOG_FILE}'; then awk '/==> Running checkpkg/ {print; exit} {print}' '${LOG_FILE}' > '${LOG_FILE}.tmp' && mv '${LOG_FILE}.tmp' '${LOG_FILE}' && echo '[OK] Build succeeded: ${PKGNAME} (${LOG_FILE})'; else echo '[ERROR] Build failed: No success marker found in log'; fi"
+
+# Ensure tmux build session exists
+tmux has-session -t build 2>/dev/null || tmux new-session -d -s build
 
 # Launch in tmux window (auto-closes on finish)
 tmux new-window -t build -n "${PKGNAME}-v${NEXT_VER}" -c "${CURRENT_DIR}" "${BUILD_CMD}; ${CHECK_CMD}"
-echo "📦 Build launched in tmux session 'build', window '${PKGNAME}-v${NEXT_VER}'"
+echo "Build launched in tmux session 'build', window '${PKGNAME}-v${NEXT_VER}'"
 echo "   Attach: tmux attach -t build"
 echo "   Log: ${LOG_FILE} (will be written in ${CURRENT_DIR})"
+echo "   [TIP] Use system monitoring tools to watch window '${PKGNAME}-v${NEXT_VER}', or poll log with smart-build-monitor.sh"
