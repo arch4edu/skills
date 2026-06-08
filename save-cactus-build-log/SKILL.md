@@ -40,7 +40,7 @@ The full workflow log typically has ~1500 lines but the Build step is only ~40-1
 | `-o <dir>` | Output directory | `/tmp` |
 | `-f` | Full log (no build-step filtering) | off |
 | `-r` | Raw output (keep timestamps and ANSI) | off |
-| `-h` | Show help | — |
+| `-h` | Show help | - |
 
 ## Output
 
