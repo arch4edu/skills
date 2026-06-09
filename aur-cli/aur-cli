@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-AUR CLI tool - read-only edition.
-Provides package comment retrieval, flag comment inspection, and co-maintainer search.
-No login or write operations.
+AUR CLI tool.
+Provides package info, flag comment inspection, co-maintainer search, login, adopt, and disown.
 """
 
 import hashlib
-import http.cookiejar
 import itertools
 import json
 import re
 import sys
 from pathlib import Path
+
+# Allow importing config.py from the same directory as this script
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+try:
+    import config as _config
+except ImportError:
+    _config = None
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,6 +32,18 @@ def ensure_dir(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _load_cookie_dict(filepath):
+    """Load cookies from a JSON file as a name->value dict. Returns dict or None."""
+    if not Path(filepath).exists():
+        return None
+    try:
+        with open(filepath, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to load cookies from {filepath}: {e}", file=sys.stderr)
+        return None
+
+
 def save_cookies_to_file(cj, filepath):
     """Save cookies to a JSON file."""
     ensure_dir(filepath)
@@ -36,39 +54,222 @@ def save_cookies_to_file(cj, filepath):
         json.dump(cookie_dict, f, indent=2)
 
 
-def load_cookies_from_file(filepath):
-    """Load cookies from a JSON file. Returns CookieJar or None."""
-    if not Path(filepath).exists():
-        return None
-    try:
-        with open(filepath, 'r') as f:
-            cookie_dict = json.load(f)
-        cj = http.cookiejar.CookieJar()
-        for name, value in cookie_dict.items():
-            cookie = http.cookiejar.Cookie(
-                version=0, name=name, value=value, port=None,
-                port_specified=False, domain='.archlinux.org', domain_specified=True,
-                domain_initial_dot=True, path='/', path_specified=True,
-                secure=False, expires=0, discard=False, comment=None, comment_url=None,
-                rest={'HttpOnly': None}, rfc2109=False,
-            )
-            cj.set_cookie(cookie)
-        return cj
-    except Exception as e:
-        print(f"Warning: Failed to load cookies from {filepath}: {e}", file=sys.stderr)
-        return None
-
-
 def create_session():
     """Create a requests.Session with headers and loaded cookies."""
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'arch4edu-aur-cli/1.0 (read-only)',
+        'User-Agent': 'arch4edu-aur-cli/1.0',
+        'Accept-Language': 'en',
     })
-    cj = load_cookies_from_file(COOKIE_FILE)
-    if cj:
-        session.cookies.update(cj)
+    cookie_dict = _load_cookie_dict(COOKIE_FILE)
+    if cookie_dict:
+        for name, value in cookie_dict.items():
+            session.cookies.set(name, value, domain='aur.archlinux.org', path='/')
     return session
+
+
+def login_to_aur(username, password, cookie_file=None):
+    """Login to AUR with username and password.
+
+    Returns (success, message, cookie_jar_or_None).
+    On success with cookie_file, saves cookies to that file.
+    """
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'arch4edu-aur-cli/1.0',
+    })
+
+    login_url = "https://aur.archlinux.org/login?next=/"
+    resp = smart_request(session, 'get', login_url)
+
+    if resp.status_code != 200:
+        return False, f"Failed to access login page (HTTP {resp.status_code})", None
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+
+    login_form = soup.find('form', action=re.compile(r'/login'))
+    if not login_form:
+        login_form = soup.find('form')
+    if not login_form:
+        return False, "Login form not found on AUR page", None
+
+    hidden_inputs = login_form.find_all('input', {'type': 'hidden'})
+    post_data = {}
+    for inp in hidden_inputs:
+        name = inp.get('name')
+        value = inp.get('value', '')
+        if name:
+            post_data[name] = value
+
+    post_data['user'] = username
+    post_data['passwd'] = password
+    post_data['remember_me'] = 'on'
+    post_data['next'] = '/'
+
+    csrf_input = login_form.find('input', {'name': '_csrftoken'})
+    if csrf_input and '_csrftoken' not in post_data:
+        post_data['_csrftoken'] = csrf_input['value']
+
+    headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://aur.archlinux.org',
+        'Referer': login_url,
+    }
+
+    try:
+        post_resp = smart_request(session, 'post', login_url, data=post_data, headers=headers, allow_redirects=True)
+
+        if post_resp.status_code in [200, 302, 303]:
+            text = post_resp.text
+
+            if 'logout' in text.lower() or '/account/' in post_resp.url:
+                cj = session.cookies
+                if cookie_file:
+                    save_cookies_to_file(cj, cookie_file)
+                return True, "Login successful", cj
+
+            error_patterns = [
+                (r'Invalid username or password', 'Invalid credentials'),
+                (r'login failed', 'Login failed'),
+            ]
+            for pattern, error_msg in error_patterns:
+                if re.search(pattern, text.lower()):
+                    return False, error_msg, None
+
+        return False, f"HTTP {post_resp.status_code}: Unexpected response", None
+
+    except Exception as e:
+        return False, f"Exception: {str(e)}", None
+
+
+def resolve_pkgbase(session, package_name):
+    """Resolve pkgbase from a package name by fetching the package page."""
+    pkg_url = f"https://aur.archlinux.org/packages/{package_name}/"
+    resp = smart_request(session, 'get', pkg_url, cookie_file=COOKIE_FILE)
+
+    if resp.status_code != 200:
+        print(f"Error: Failed to fetch package page (HTTP {resp.status_code})", file=sys.stderr)
+        return None
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    for pkgbase_link in soup.find_all('a', href=re.compile(r'/pkgbase/')):
+        href = pkgbase_link['href']
+        parts = [p for p in href.split('/') if p]
+        if len(parts) == 2 and parts[0] == 'pkgbase':
+            return parts[1]
+
+    return package_name
+
+
+def _adopt_pkgbase(session, pkgbase):
+    """Adopt a pkgbase via direct POST. Returns (success, message)."""
+    post_url = f"https://aur.archlinux.org/pkgbase/{pkgbase}/adopt"
+    headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://aur.archlinux.org',
+        'Referer': f"https://aur.archlinux.org/pkgbase/{pkgbase}/",
+    }
+
+    try:
+        post_resp = smart_request(session, 'post', post_url, data={}, headers=headers,
+                                  allow_redirects=True, cookie_file=COOKIE_FILE)
+
+        if post_resp.status_code in [200, 302, 303]:
+            if 'login' in post_resp.url:
+                return False, "Not logged in - run 'login --save' first"
+
+            # Verify by checking if disown page is accessible
+            verify_resp = smart_request(session, 'get',
+                f"https://aur.archlinux.org/pkgbase/{pkgbase}/disown",
+                cookie_file=COOKIE_FILE)
+            if verify_resp.status_code == 200 and 'login' not in verify_resp.url:
+                soup = BeautifulSoup(verify_resp.text, 'html.parser')
+                if soup.find('form', action=re.compile(r'/disown')):
+                    return True, f"Successfully adopted {pkgbase}"
+
+            return False, f"Adopt may have failed - could not verify"
+
+        return False, f"HTTP {post_resp.status_code}: Adopt failed"
+
+    except Exception as e:
+        return False, f"Exception during adopt: {str(e)}"
+
+
+def _disown_pkgbase(session, pkgbase):
+    """Disown a pkgbase via GET confirmation page then POST with confirm=1.
+    Returns (success, message).
+    """
+    disown_url = f"https://aur.archlinux.org/pkgbase/{pkgbase}/disown"
+    headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://aur.archlinux.org',
+        'Referer': disown_url,
+    }
+
+    try:
+        get_resp = smart_request(session, 'get', disown_url, cookie_file=COOKIE_FILE)
+
+        if get_resp.status_code != 200:
+            return False, f"Failed to fetch disown page (HTTP {get_resp.status_code})"
+
+        if 'login' in get_resp.url:
+            return False, "Not logged in - run 'login --save' first"
+
+        soup = BeautifulSoup(get_resp.text, 'html.parser')
+        disown_form = soup.find('form', action=re.compile(r'/disown'))
+        post_data = {'confirm': '1'}
+        if disown_form:
+            for inp in disown_form.find_all('input', {'type': 'hidden'}):
+                name = inp.get('name')
+                value = inp.get('value', '')
+                if name and name != 'next':
+                    post_data[name] = value
+        # Override next to redirect to actual pkgbase page
+        post_data['next'] = f'/pkgbase/{pkgbase}'
+
+        post_resp = smart_request(session, 'post', disown_url, data=post_data, headers=headers,
+                                  allow_redirects=True, cookie_file=COOKIE_FILE)
+
+        if post_resp.status_code in [200, 302, 303]:
+            if 'login' in post_resp.url:
+                return False, "Not logged in - run 'login --save' first"
+
+            # Verify by checking if adopt form is present (package is orphaned)
+            verify_resp = smart_request(session, 'get',
+                f"https://aur.archlinux.org/pkgbase/{pkgbase}/",
+                cookie_file=COOKIE_FILE)
+            if verify_resp.status_code == 200:
+                soup = BeautifulSoup(verify_resp.text, 'html.parser')
+                if soup.find('form', action=re.compile(r'/adopt')):
+                    return True, f"Successfully disowned {pkgbase}"
+
+            return False, f"Disown may have failed - could not verify"
+
+        return False, f"HTTP {post_resp.status_code}: Disown failed"
+
+    except Exception as e:
+        return False, f"Exception during disown: {str(e)}"
+
+
+def adopt_package(package_name):
+    """Adopt an AUR package. Returns (success, message)."""
+    session = create_session()
+    pkgbase = resolve_pkgbase(session, package_name)
+    if not pkgbase:
+        return False, f"Could not resolve pkgbase for {package_name}"
+    return _adopt_pkgbase(session, pkgbase)
+
+
+def disown_package(package_name):
+    """Disown an AUR package. Returns (success, message)."""
+    session = create_session()
+    pkgbase = resolve_pkgbase(session, package_name)
+    if not pkgbase:
+        return False, f"Could not resolve pkgbase for {package_name}"
+    return _disown_pkgbase(session, pkgbase)
 
 
 def solve_anubis_challenge(challenge, difficulty=4):
@@ -610,17 +811,20 @@ def output_table_packages(packages):
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description='AUR CLI tool (read-only) - query package info, flag status, co-maintainers, and source files'
+        description='AUR CLI tool - query package info, flag status, co-maintainers, source files, login, adopt, and disown'
     )
     parser.add_argument(
         'command',
-        choices=['get-info', 'get-flag-comment', 'search-by-co-maintainer', 'get-source'],
+        choices=['get-info', 'get-flag-comment', 'search-by-co-maintainer', 'get-source', 'login', 'adopt', 'disown'],
         help='Command to execute'
     )
     parser.add_argument('--package', help='Package name (required for get-info, get-flag-comment, get-source)')
     parser.add_argument('--maintainer', help='Maintainer name (required for search-by-co-maintainer)')
     parser.add_argument('--file', default='PKGBUILD', help='File path to fetch (default: PKGBUILD, for get-source)')
     parser.add_argument('--json', action='store_true', help='Output in JSON format')
+    parser.add_argument('--username', help='AUR username (overrides config.py)')
+    parser.add_argument('--password', help='AUR password (overrides config.py)')
+    parser.add_argument('--save', action='store_true', help='Save cookies to local file after successful login')
 
     args = parser.parse_args()
 
@@ -684,6 +888,68 @@ def main():
             output_json({'package': args.package, 'file': args.file, 'content': content})
         else:
             print(content, end='')
+
+    elif args.command == 'login':
+        username = args.username
+        password = args.password
+
+        if not username or not password:
+            if _config is None:
+                print("Error: config.py not found in skill directory", file=sys.stderr)
+                print("Create config.py with AUR_USERNAME and AUR_PASSWORD variables", file=sys.stderr)
+                sys.exit(1)
+            username = username or getattr(_config, 'AUR_USERNAME', '')
+            password = password or getattr(_config, 'AUR_PASSWORD', '')
+
+        if not username or not password:
+            print("Error: AUR credentials required", file=sys.stderr)
+            print("Provide via --username/--password or config.py (AUR_USERNAME/AUR_PASSWORD)", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"[*] Logging in to AUR as: {username}", file=sys.stderr)
+
+        cookie_file = COOKIE_FILE if args.save else None
+        success, message, cj = login_to_aur(username, password, cookie_file=cookie_file)
+
+        if success:
+            print(f"[OK] {message}")
+            if cookie_file:
+                print(f"[*] Cookies saved to {cookie_file}", file=sys.stderr)
+        else:
+            print(f"[ERROR] Login failed: {message}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == 'adopt':
+        if not args.package:
+            print("Error: --package is required for adopt", file=sys.stderr)
+            sys.exit(1)
+
+        success, message = adopt_package(args.package)
+
+        if args.json:
+            output_json({'package': args.package, 'action': 'adopt', 'success': success, 'message': message})
+        else:
+            if success:
+                print(f"[OK] {message}")
+            else:
+                print(f"[ERROR] {message}", file=sys.stderr)
+                sys.exit(1)
+
+    elif args.command == 'disown':
+        if not args.package:
+            print("Error: --package is required for disown", file=sys.stderr)
+            sys.exit(1)
+
+        success, message = disown_package(args.package)
+
+        if args.json:
+            output_json({'package': args.package, 'action': 'disown', 'success': success, 'message': message})
+        else:
+            if success:
+                print(f"[OK] {message}")
+            else:
+                print(f"[ERROR] {message}", file=sys.stderr)
+                sys.exit(1)
 
 
 if __name__ == "__main__":

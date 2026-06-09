@@ -1,13 +1,13 @@
 ---
 name: aur-cli
-description: Read-only AUR package querying. get-info for metadata/dependencies, get-source for PKGBUILD/.SRCINFO, get-flag-comment for OOD flags, search-by-co-maintainer for maintainer packages. Use whenever you need AUR package information — never use web scraping or AUR RPC API directly.
+description: AUR package querying, login, adopt, and disown. get-info for metadata/dependencies, get-source for PKGBUILD/.SRCINFO, get-flag-comment for OOD flags, search-by-co-maintainer for maintainer packages, login for AUR authentication, adopt/disown for package maintenance. Use whenever you need AUR package information - never use web scraping or AUR RPC API directly.
 ---
 
 # AUR CLI
 
 ## Overview
 
-Read-only tool to query AUR package information. Located at `~/bin/aur-cli`.
+Tool to query AUR package information, manage login, and adopt/disown packages. Located at `~/bin/aur-cli`.
 
 **MANDATORY: Always use `~/bin/aur-cli` for AUR queries. Never use web scraping, AUR RPC API directly, or other methods.**
 
@@ -63,6 +63,56 @@ Find all packages co-maintained by a specific user.
 ~/bin/aur-cli search-by-co-maintainer --maintainer <name>
 ```
 
+### login
+
+Login to AUR with credentials from config.py and optionally save session cookies.
+
+```bash
+# Login using credentials from config.py, save cookies
+~/bin/aur-cli login --save
+
+# Login using CLI credentials (overrides config.py)
+~/bin/aur-cli login --username <user> --password <pass> --save
+
+# Login without saving cookies (session only)
+~/bin/aur-cli login
+```
+
+Credentials are read from `config.py` in the skill directory (same directory as the `aur-cli` script):
+
+```python
+AUR_USERNAME = "your_aur_username"
+AUR_PASSWORD = "your_aur_password"
+```
+
+CLI `--username`/`--password` overrides config.py values.
+
+### adopt
+
+Adopt an AUR package (become its maintainer). Requires a valid login session (run `login --save` first).
+
+```bash
+~/bin/aur-cli adopt --package <pkgname>
+
+# JSON output
+~/bin/aur-cli adopt --package <pkgname> --json
+```
+
+Automatically resolves pkgbase for split packages.
+
+### disown
+
+Disown an AUR package (give up maintainer status). Requires a valid login session (run `login --save` first).
+
+```bash
+~/bin/aur-cli disown --package <pkgname>
+
+# JSON output
+~/bin/aur-cli disown --package <pkgname> --json
+```
+
+Automatically resolves pkgbase for split packages.
+
 ## Common Use Cases in arch4edu Workflow
 
 1. **Check depends vs makedepends**: Use `get-source --file .SRCINFO` to see standardized dependency types
@@ -75,5 +125,7 @@ Find all packages co-maintained by a specific user.
 
 - Automatically handles Anubis (Arch Linux anti-bot) challenges
 - Saves cookies to `~/.config/aurcli/cookies.json` after solving challenges
-- All operations are read-only — no login or write capabilities
+- `login --save` persists session cookies for use by other commands
+- `adopt` and `disown` are write operations that require a valid session (run `login --save` first)
+- Credentials are stored in `config.py` (same directory as the aur-cli script) - do NOT commit config.py with real credentials
 - Dependencies from `.SRCINFO` distinguish: `depends` (runtime), `makedepends` (build-time), `checkdepends` (test-time), `optdepends` (optional)
