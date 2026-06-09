@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# build-monitor: watch a tmux build session window, notify when it closes.
+#
+# Usage:
+#   build-monitor <window-name>
+#
+# Session ID is read from $QODER_SESSION_ID.
+# Monitor runs in tmux "monitor" session, window named "<window-name>-<session-id>".
+# To list running monitors: tmux list-windows -t monitor
+# To stop: close the monitor window (Ctrl-b k) in the monitor session.
+
+set -euo pipefail
+
+SESSION_ID="${QODER_SESSION_ID:-}"
+WINDOW_NAME="${1:-}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  build-monitor <window-name>
+
+Watch a tmux "build" session window. When the window closes (build
+finished or failed), send a notification to the qoderwake session.
+
+Session ID is read from $QODER_SESSION_ID.
+
+Arguments:
+  <window-name>   Build window name to watch (required)
+
+Examples:
+  build-monitor "java-testng-v2"
+  build-monitor "cactusreader-v1"
+
+To check running monitors: tmux list-windows -t monitor
+EOF
+    exit 0
+}
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && usage
+
+if [[ -z "$SESSION_ID" ]]; then
+    echo "error: \$QODER_SESSION_ID not set" >&2
+    exit 1
+fi
+
+if [[ -z "$WINDOW_NAME" ]]; then
+    echo "error: window name required" >&2
+    echo "usage: build-monitor <window-name>" >&2
+    exit 1
+fi
+
+MONITOR_NAME="${WINDOW_NAME}-${SESSION_ID}"
+
+# Dedup: kill any existing monitor window with the same name
+if tmux list-windows -t monitor -F '#{window_name}' 2>/dev/null | grep -qxF "$MONITOR_NAME"; then
+    tmux kill-window -t "monitor:=${MONITOR_NAME}" 2>/dev/null || true
+    sleep 0.5
+fi
+
+# Ensure monitor session exists
+tmux has-session -t monitor 2>/dev/null || tmux new-session -d -s monitor
+
+MONITOR_SCRIPT=$(mktemp /tmp/build-monitor-XXXXXX.sh)
+cat > "$MONITOR_SCRIPT" <<INNEREOF
+#!/usr/bin/env bash
+trap 'rm -f "\$0"' EXIT
+while true; do
+    if ! tmux list-windows -t build -F '#{window_name}' 2>/dev/null | grep -qxF '${WINDOW_NAME}'; then
+        MSG="[build-monitor] ${WINDOW_NAME} build window has closed, please check the log"
+        EVENTS_JSON=\$(jq -nc --arg msg "\$MSG" --arg uuid "controller-user:build-monitor-${WINDOW_NAME}" \
+          '[{"event_type":"user","payload":{"type":"user","message":{"role":"tool","content":[{"type":"text","text":\$msg}]},"uuid":\$uuid,"session_id":""}}]')
+        qoderwake session send --session-id '${SESSION_ID}' --events-json "\$EVENTS_JSON" >/dev/null 2>&1 || true
+        exit 0
+    fi
+    sleep 5
+done
+INNEREOF
+chmod +x "$MONITOR_SCRIPT"
+
+tmux new-window -t monitor -n "$MONITOR_NAME" bash "$MONITOR_SCRIPT"
+
+echo "[build-monitor] watching window '$WINDOW_NAME' in tmux session 'monitor' (monitor window: '$MONITOR_NAME')"
