@@ -16,6 +16,8 @@ name="$1"
 pane="$2"
 if [[ "$name" == "✨"* ]]; then
     tmux rename-window -t "$pane" "${name#✨}"
+elif [[ "$name" == "🔥"* ]]; then
+    : # still running, keep 🔥
 fi
 SCRIPT
 chmod +x "$CLEAR_SCRIPT"
@@ -30,19 +32,23 @@ mode="\${1:-idle}"
 
 tmux set-hook -g after-select-window \\
   "run-shell '$CLEAR_SCRIPT \"#{window_name}\" \"#{pane_id}\"'" 2>/dev/null
+tmux set-hook -g after-select-pane \\
+  "run-shell '$CLEAR_SCRIPT \"#{window_name}\" \"#{pane_id}\"'" 2>/dev/null
 
 target_pane="\${TMUX_PANE}"
+current=\$(tmux display-message -t "\$target_pane" -p '#{window_name}' 2>/dev/null) || exit 0
 
 case "\$mode" in
   active) target="🔥\$base" ;;
   done)
+    # Only touch window if it currently shows our own 🔥 (another pane's session may own it)
+    if [[ "\$current" != "🔥\$base" ]]; then exit 0; fi
     active=\$(tmux display-message -t "\$target_pane" -p '#{window_active} #{session_active}' 2>/dev/null)
     [ "\$active" = "1 1" ] && target="\$base" || target="✨\$base"
     ;;
   *) target="\$base" ;;
 esac
 
-current=\$(tmux display-message -t "\$target_pane" -p '#{window_name}' 2>/dev/null) || exit 0
 [ "\$current" != "\$target" ] && tmux rename-window -t "\$target_pane" "\$target"
 exit 0
 SCRIPT

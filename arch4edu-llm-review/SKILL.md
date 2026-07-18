@@ -31,17 +31,24 @@ point of the skill -- an independent second pair of eyes.
 
 ### Step 1: Get the diff and compute hash
 
-```bash
-# Get the diff (last commit)
-git show --pretty= -p HEAD
+The hash MUST match the pre-push hook's algorithm exactly. The hook combines
+`git show --stat` output with the raw diff, separated by `\n\n---\n\n`:
 
+```bash
 # Compute the hash (same algorithm as pre-push hook)
-DIFF=$(git show --pretty= -p HEAD)
-DIFF_HASH=$(printf '%s' "$DIFF" | sha256sum | cut -c1-16)
+COMMIT=$(git log -1 --format=%H)
+STAT=$(git show --stat --format="%h   %s%n%an <%ae>" "$COMMIT")
+DIFF=$(git show --pretty= -p "$COMMIT")
+COMBINED="${STAT}
+
+---
+
+${DIFF}"
+DIFF_HASH=$(printf '%s' "$COMBINED" | sha256sum | cut -c1-16)
 ```
 
-The hash is the first 16 chars of sha256 of the raw diff output. Pass both the
-raw diff and the hash to the agent.
+The hash is the first 16 chars of sha256 of the combined stat+diff output.
+Pass the raw diff (not the combined content) and the hash to the agent.
 
 ### Step 2: Spawn an independent review agent
 

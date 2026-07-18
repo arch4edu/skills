@@ -19,6 +19,7 @@ python3 ~/.qoder/skills/arch4edu-junior-fixer/scripts/fix-check.py
 python3 ~/.qoder/skills/arch4edu-junior-fixer/scripts/fix-gpg.py
 python3 ~/.qoder/skills/arch4edu-junior-fixer/scripts/fix-r-sources.py
 python3 ~/.qoder/skills/arch4edu-junior-fixer/scripts/fix-checksums.py
+python3 ~/.qoder/skills/arch4edu-junior-fixer/scripts/fix-stuck.py
 ```
 
 ### Script Summary
@@ -32,6 +33,7 @@ python3 ~/.qoder/skills/arch4edu-junior-fixer/scripts/fix-checksums.py
 | `fix-gpg.py` | Failed in gpg() | Lists all fixable packages (add --skippgpcheck) |
 | `fix-r-sources.py` | Failed in sources() | R CRAN packages only, skips non-R |
 | `fix-checksums.py` | Failed in checksums() | Auto-checks maintainer via aur-cli, skips arch4edu members |
+| `fix-stuck.py` | Stuck SCHEDULED/BUILDING | Detects SCHEDULED >1h and BUILDING >6h, lists packages needing trigger-rebuild |
 
 ## Fixable Categories — Detailed Instructions
 
@@ -232,16 +234,21 @@ pre_build: |
 
 **Note:** Use plain `replace` (not `replace -u`) since we know the correct hash.
 
-### 7. Stuck SCHEDULED (>1 hour)
+### 7. Stuck SCHEDULED/BUILDING
 
-When a package has been in SCHEDULED status for more than 1 hour, it may need a manual rebuild trigger.
+When a package has been stuck in SCHEDULED (>1 hour) or BUILDING (>6 hours), it likely needs a rebuild trigger.
 
-**Step 1:** Check the package status and timestamp in builds.json.
+**Step 1:** Run the detection script:
+```bash
+python3 ~/.qoder/skills/arch4edu-junior-fixer/scripts/fix-stuck.py
+```
 
-**Step 2:** Use trigger-rebuild skill to re-trigger the build:
+**Step 2:** For each stuck package, use trigger-rebuild to re-trigger:
 ```bash
 python3 ~/.qoder/skills/trigger-rebuild/scripts/trigger-rebuild.py <full-path>
 ```
+
+**Note:** BUILDING packages with age < 6h may still be compiling normally (e.g. openfoam, large C++ projects). Use judgement before triggering.
 
 ### 8. ABI incompatibility (lazy loading failed)
 
