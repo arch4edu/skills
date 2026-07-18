@@ -144,6 +144,41 @@ add depends wxwidgets-gtk3
 add checkdepends flake8
 ```
 
+### Environment Variable Injection (echo export trick)
+
+When you need to set environment variables (like `CFLAGS`, `CXXFLAGS`, `LDFLAGS`) for the entire build, append an `export` statement to the end of PKGBUILD using `echo`:
+
+```yaml
+pre_build: |
+  aur-pre-build
+  echo 'export CFLAGS+=" -Wno-error=incompatible-pointer-types"' >> PKGBUILD
+  echo 'export CXXFLAGS+=" -Wno-error=template-id-cdtor"' >> PKGBUILD
+```
+
+**Why this works**: `makepkg` sources the entire PKGBUILD file before executing any functions. An `export` statement at the end of the file sets the variable globally for all subsequent function calls (`build()`, `package()`, etc.).
+
+**When to use**: 
+- Compiler warnings that need to be suppressed globally (e.g., `-Wno-error=...`)
+- Build flags that affect the entire compilation
+- Environment variables needed by configure scripts or cmake
+
+**Advantages over sed**:
+- Simpler syntax, no complex escaping
+- More reliable (doesn't depend on matching specific lines)
+- Affects the entire build, not just one function
+
+```bash
+# Single flag
+echo 'export CFLAGS+=" -Wno-error=incompatible-pointer-types"' >> PKGBUILD
+
+# Multiple flags (multiple echo statements)
+echo 'export CFLAGS+=" -Wno-error=template-id-cdtor"' >> PKGBUILD
+echo 'export LDFLAGS+=" -fuse-ld=gold"' >> PKGBUILD
+
+# Override completely (note: no +=)
+echo 'export CFLAGS="-O2 -pipe"' >> PKGBUILD
+```
+
 ### `replace`
 
 Performs a single string replacement in PKGBUILD (first occurrence only).
@@ -336,5 +371,18 @@ makedepends:
   - any/pypy3-setuptools
 build_prefix: extra-x86_64
 pre_build: aur-pre-build
+post_build: aur-post-build
+```
+
+### Package needing compiler warning suppression
+
+```yaml
+nvchecker:
+  - source: aur
+    aur:
+build_prefix: extra-x86_64
+pre_build: |
+  aur-pre-build
+  echo 'export CFLAGS+=" -Wno-error=incompatible-pointer-types"' >> PKGBUILD
 post_build: aur-post-build
 ```
