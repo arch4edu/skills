@@ -33,6 +33,7 @@ chore: <description>
 
 - No Chinese in SKILL.md, scripts, or commit messages -- English only
 - No absolute paths in code -- use `~/` or relative paths
+- No secrets, API keys, tokens, or credentials in committed files
 - Plain ASCII only (no em dashes, smart quotes, etc.)
 
 ## Gotchas

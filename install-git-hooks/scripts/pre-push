@@ -227,10 +227,11 @@ def main():
     print(f"[LLM] Review result: {llm_result}" + (" (cached)" if is_cached else ""))
     if llm_result == "reject":
         print(f"[LLM] Rejected: {llm_reason}")
-        try:
-            backend.send_rejection(repo_name, git_diff, llm_reason, is_cached)
-        except Exception as e:
-            print(f"Failed to send rejection notification: {e}")
+        if "No review record" not in llm_reason and "Redis unavailable" not in llm_reason:
+            try:
+                backend.send_rejection(repo_name, git_diff, llm_reason, is_cached)
+            except Exception as e:
+                print(f"Failed to send rejection notification: {e}")
         print("❌ Rejected by LLM review.")
         sys.exit(1)
     else:
