@@ -21,7 +21,6 @@ HOOKS_DIR="$(git rev-parse --git-dir)/hooks"
 # Source files
 PRE_PUSH_SRC="$SCRIPT_DIR/pre-push"
 PRE_COMMIT_SRC="$SCRIPT_DIR/pre-commit"
-POST_COMMIT_SRC="$SCRIPT_DIR/post-commit"
 
 # Install a hook
 install_hook() {
@@ -52,7 +51,6 @@ install_hook() {
 
 install_hook "$PRE_PUSH_SRC" "pre-push"
 install_hook "$PRE_COMMIT_SRC" "pre-commit"
-install_hook "$POST_COMMIT_SRC" "post-commit"
 
 echo ""
 echo "🎉 All hooks installed!"
