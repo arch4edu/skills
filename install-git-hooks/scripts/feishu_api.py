@@ -147,21 +147,19 @@ def urgent_message(token, message_id, user_ids):
 # These functions provide a common interface that hook scripts use.
 # Other backends (e.g. telegram_api) must implement the same signatures.
 
-def send_rejection(repo_name, git_diff, llm_reason, is_cached=False):
+def send_rejection(repo_name, git_diff, llm_reason):
     """Send LLM rejection notification. Returns (msg_id, token)."""
-    cache_tag = " (cached)" if is_cached else ""
     content_parts = [
-        {"tag": "markdown", "content": f"**❌ LLM 审核拒绝{cache_tag}**: {llm_reason}"},
+        {"tag": "markdown", "content": f"**❌ LLM 审核拒绝**: {llm_reason}"},
         {"tag": "markdown", "content": f"**🔔 Push 审批请求 | {repo_name}**\n\n```\n{git_diff}\n```"},
     ]
     return send_card(feishu_dest, content_parts)
 
 
-def send_approval_request(repo_name, git_diff, is_cached=False):
+def send_approval_request(repo_name, git_diff):
     """Send approval request card. Returns (msg_id, chat_id, token)."""
-    cache_tag = " (cached)" if is_cached else ""
     content_parts = [
-        {"tag": "markdown", "content": f"**✅ LLM 审核通过{cache_tag}**"},
+        {"tag": "markdown", "content": "**✅ LLM 审核通过**"},
         {"tag": "markdown", "content": f"**🔔 Push 审批请求 | {repo_name}**\n\n```\n{git_diff}\n```"},
     ]
     return send_card(feishu_dest, content_parts)

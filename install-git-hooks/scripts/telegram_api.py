@@ -218,11 +218,10 @@ async def _remove_future(message_id):
 
 # ── Unified backend interface ──────────────────────────────────────────────
 
-def send_rejection(repo_name, git_diff, llm_reason, is_cached=False):
+def send_rejection(repo_name, git_diff, llm_reason):
     """Send LLM rejection notification. Returns (msg_id, chat_id, token)."""
-    cache_tag = " (cached)" if is_cached else ""
     text = (
-        f"❌ **LLM 审核拒绝{cache_tag}**: {llm_reason}\n\n"
+        f"❌ **LLM 审核拒绝**: {llm_reason}\n\n"
         f"🔔 **Push 审批请求 | {repo_name}**\n\n"
         f"```\n{git_diff}\n```"
     )
@@ -230,14 +229,13 @@ def send_rejection(repo_name, git_diff, llm_reason, is_cached=False):
     return msg_id, telegram_chat_id, telegram_bot_token
 
 
-def send_approval_request(repo_name, git_diff, is_cached=False):
+def send_approval_request(repo_name, git_diff):
     """
     Send approval request with inline keyboard buttons.
     Returns (msg_id, chat_id, token).
     """
-    cache_tag = " (cached)" if is_cached else ""
     text = (
-        f"✅ **LLM 审核通过{cache_tag}**\n\n"
+        f"✅ **LLM 审核通过**\n\n"
         f"🔔 **Push 审批请求 | {repo_name}**\n\n"
         f"```\n{git_diff}\n```"
     )
