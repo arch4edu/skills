@@ -64,22 +64,22 @@ def llm_review(diff_content):
     if not r:
         print("[LLM] Redis unavailable. Cannot verify review.")
         print("[LLM] Please run the arch4edu-llm-review skill first.")
-        return "reject", "Redis unavailable - run arch4edu-llm-review skill", False
+        return "reject", "Redis unavailable - run arch4edu-llm-review skill"
 
     try:
         cached = r.get(cache_key)
         if cached:
             cached_data = json.loads(cached)
             print(f"[LLM] Review record found! TTL: {r.ttl(cache_key)}s")
-            return cached_data.get('result', 'reject'), cached_data.get('reason', 'No reason'), True
+            return cached_data.get('result', 'reject'), cached_data.get('reason', 'No reason')
         else:
             print("[LLM] No review record found for this diff.")
             print("[LLM] Please run the arch4edu-llm-review skill to review your changes before pushing.")
-            return "reject", "No review record - run arch4edu-llm-review skill first", False
+            return "reject", "No review record - run arch4edu-llm-review skill first"
     except Exception as e:
         print(f"[Redis] Read error: {e}")
         print("[LLM] Please run the arch4edu-llm-review skill first.")
-        return "reject", f"Redis read error: {e}", False
+        return "reject", f"Redis read error: {e}"
 
 
 def wait_for_approval_feishu(backend, msg_id, token, author_name):
@@ -223,24 +223,24 @@ def main():
 
     # ===== LLM review =====
     print(f"[LLM] Running code review on {len(git_diff)} chars of diff...")
-    llm_result, llm_reason, is_cached = llm_review(git_diff)
-    print(f"[LLM] Review result: {llm_result}" + (" (cached)" if is_cached else ""))
+    llm_result, llm_reason = llm_review(git_diff)
+    print(f"[LLM] Review result: {llm_result}")
     if llm_result == "reject":
         print(f"[LLM] Rejected: {llm_reason}")
         if "No review record" not in llm_reason and "Redis unavailable" not in llm_reason:
             try:
-                backend.send_rejection(repo_name, git_diff, llm_reason, is_cached)
+                backend.send_rejection(repo_name, git_diff, llm_reason)
             except Exception as e:
                 print(f"Failed to send rejection notification: {e}")
         print("❌ Rejected by LLM review.")
         sys.exit(1)
     else:
-        print(f"[LLM] Accepted" + (" (from cache)" if is_cached else ""))
+        print("[LLM] Accepted")
 
     print(f"Pre-push: Detected push to {repo_name}. Requesting {notification_backend} approval...")
 
     try:
-        msg_id, chat_id, token = backend.send_approval_request(repo_name, git_diff, is_cached)
+        msg_id, chat_id, token = backend.send_approval_request(repo_name, git_diff)
         print(f"Sent notification: {msg_id}")
 
         try:
