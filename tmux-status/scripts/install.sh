@@ -61,6 +61,7 @@ s = sys.argv[1]
 print(json.dumps({
     "UserPromptSubmit": [{"async": True, "hooks": [{"type": "command", "command": f"{s} active"}]}],
     "Stop":             [{"async": True, "hooks": [{"type": "command", "command": f"{s} done"}]}],
+    "StopFailure":      [{"async": True, "hooks": [{"type": "command", "command": f"{s} done"}]}],
     "SessionStart":     [{"async": True, "hooks": [{"type": "command", "command": f"{s} idle"}]}],
     "SessionEnd":       [{"async": True, "hooks": [{"type": "command", "command": f"{s} idle"}]}],
 }))
