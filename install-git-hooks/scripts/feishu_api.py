@@ -159,7 +159,6 @@ def send_rejection(repo_name, git_diff, llm_reason):
 def send_approval_request(repo_name, git_diff):
     """Send approval request card. Returns (msg_id, chat_id, token)."""
     content_parts = [
-        {"tag": "markdown", "content": "**✅ LLM 审核通过**"},
         {"tag": "markdown", "content": f"**🔔 Push 审批请求 | {repo_name}**\n\n```\n{git_diff}\n```"},
     ]
     return send_card(feishu_dest, content_parts)

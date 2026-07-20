@@ -235,7 +235,6 @@ def send_approval_request(repo_name, git_diff):
     Returns (msg_id, chat_id, token).
     """
     text = (
-        f"✅ **LLM 审核通过**\n\n"
         f"🔔 **Push 审批请求 | {repo_name}**\n\n"
         f"```\n{git_diff}\n```"
     )
