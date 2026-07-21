@@ -71,11 +71,62 @@ python3 smart-add-package.py -t template/x86_64-simple.yaml x86_64/r/r-newpackag
 
 ## Workflow
 
-1. Run the script to add the package
-2. Review the generated cactus.yaml
-3. **Check target package diff**: run `git diff <target-path>/cactus.yaml` - only depends/makedepends/checkdepends changes are expected. Revert any other changes (e.g., nvchecker, build_prefix, makepkg_args, pre_build, post_build) with `git checkout -- <target-path>/cactus.yaml` and manually re-apply only the dep changes
-4. Commit the new package directory
-5. Push to trigger build
+### Pre-add: Dependency Analysis
+
+Before running smart-add-package, assess dependency complexity with aur-cli:
+
+```bash
+aur-cli get-info --package <pkgname> --json
+```
+
+Check the `dependencies` list for:
+- How many deps are NOT in Arch official repos (`pacman -Si <dep>`)
+- How many deps are NOT already in the cactus repo
+- Whether deps have deep recursive chains
+
+**Decision criteria:**
+- Simple (0-2 missing deps): proceed directly
+- Medium (3-5 missing deps): proceed, smart-add-package resolves recursively
+- Complex (>5 missing deps or multi-level chains): warn user, get confirmation before proceeding
+
+### Add: Run smart-add-package
+
+1. Run the script to add the package (resolves deps recursively)
+2. Review the generated cactus.yaml files
+
+### Post-add: Architecture Verification
+
+The script places packages under the target arch directory, but recursive deps
+default to the same arch. Verify each new package's correct arch:
+
+```bash
+# Check arch= from AUR PKGBUILD for each new package
+aur-cli get-source --package <pkgname> | grep "^arch="
+```
+
+**Rules:**
+- `arch=(any)` or `arch=('any')` -> package belongs in `any/`
+- `arch=(x86_64)` or contains x86_64/i686 -> package belongs in `x86_64/`
+- Python packages with C/Cython extensions (cmake, cython, glibc deps) are usually x86_64
+
+**If a package is in the wrong directory:**
+```bash
+mkdir -p <correct-arch>/<pkgname>
+mv <wrong-arch>/<pkgname>/cactus.yaml <correct-arch>/<pkgname>/cactus.yaml
+rmdir <wrong-arch>/<pkgname>
+```
+
+Then update all cactus.yaml references:
+```bash
+grep -r "<wrong-arch>/<pkgname>" --include="cactus.yaml" -l
+# Fix each reference: <wrong-arch>/<pkgname> -> <correct-arch>/<pkgname>
+```
+
+### Commit and Push
+
+1. **Check target package diff**: run `git diff <target-path>/cactus.yaml` - only depends/makedepends/checkdepends changes are expected. Revert any other changes (e.g., nvchecker, build_prefix, makepkg_args, pre_build, post_build) with `git checkout -- <target-path>/cactus.yaml` and manually re-apply only the dep changes
+2. Commit the new package directories
+3. Push to trigger build
 
 ## Important Notes
 
